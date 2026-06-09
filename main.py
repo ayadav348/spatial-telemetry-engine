@@ -1,161 +1,164 @@
 import os
-import numpy as np
+import subprocess
+import time
+import socket
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import psycopg2
+from pgvector.psycopg2 import register_vector
 import ollama
-from pypdf import PdfReader
 
-class LocalRAGPipeline:
-    def __init__(self, llm_model="llama3.2", embedding_model="nomic-embed-text", chunk_size=500, chunk_overlap=100):
-        self.llm_model = llm_model
-        self.embedding_model = embedding_model
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.documents = []        # Holds text content blocks
-        self.embeddings = []       # Holds raw continuous vector coordinate matrices
+app = FastAPI(title="Aarav Local RAG Engine")
 
-    def extract_pdf_text(self, pdf_path: str) -> str:
-        """Parses a native digital PDF and extracts raw string data."""
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"Target PDF not found at: {pdf_path}")
+# DB Configuration Parameters for Jio Allocation
+DB_PARAMS = {
+    "dbname": "aarav_vector_db",
+    "user": "postgres",
+    "password": "",  # Set your password if configured
+    "host": "localhost",
+    "port": "5432"
+}
 
-        reader = PdfReader(pdf_path)
-        extracted_text = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                extracted_text.append(text)
-        return "\n".join(extracted_text)
+LLM_MODEL = "llama3.2"
+EMBED_MODEL = "nomic-embed-text"
 
-    def chunk_text(self, text: str):
-        """Slices massive string streams into overlapping tokens to preserve context boundaries."""
-        words = text.split()
-        chunks = []
-        i = 0
-        while i < len(words):
-            chunk = " ".join(words[i : i + self.chunk_size])
-            chunks.append(chunk)
-            i += self.chunk_size - self.chunk_overlap
-        return chunks
+def bootstrap_ollama():
+    """Checks if the local Ollama port is open. If closed, automates engine boot."""
+    # Check if port 11434 is bound/listening
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        is_running = s.connect_ex(('127.0.0.1', 11434)) == 0
 
-    def ingest_data(self, source_type: str, payload: str):
-        """Processes raw input data (either text or a path to a PDF), generates embeddings
+    if not is_running:
+        print("[*] Ollama daemon is offline. Initializing automatic background boot thread...")
+        try:
+            # Spawn the systemd background task natives cleanly
+            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(3)  # Allow time slice for the socket allocation
+        except Exception as e:
+            print(f"[-] Auto-boot failed. Attempting alternative systemd invoke: {e}")
+            subprocess.Popen(["sudo", "systemctl", "start", "ollama"])
+            time.sleep(3)
 
-        via the dedicated embedding model, and stores them in a memory-mapped numpy array.
-        """
-        print(f"[*] Initializing compilation pass for input source...")
-        raw_text = ""
+    # Automatically check and pre-fetch the necessary model layers if missing
+    try:
+        local_models = [m['model'] for m in ollama.list().get('models', [])]
+        if f"{EMBED_MODEL}:latest" not in local_models and EMBED_MODEL not in local_models:
+            print(f"[*] Fetching required embedding matrix: {EMBED_MODEL}")
+            ollama.pull(EMBED_MODEL)
+        if f"{LLM_MODEL}:latest" not in local_models and LLM_MODEL not in local_models:
+            print(f"[*] Fetching required synthesis matrix: {LLM_MODEL}")
+            ollama.pull(LLM_MODEL)
+        print("[+] Ollama execution layer online and verified.")
+    except Exception as e:
+        print(f"[-] Target verification error: {e}. Confirm manually via 'ollama list'")
 
-        if source_type.lower() == "pdf":
-            raw_text = self.extract_pdf_text(payload)
-        else:
-            raw_text = payload
+# Run the host automation routine
+bootstrap_ollama()
 
-        # Chunk the payload
-        chunks = self.chunk_text(raw_text)
-        self.documents = chunks
+def init_db():
+    """Initializes extension registers and core vector tracking tables."""
+    conn = psycopg2.connect(**DB_PARAMS)
+    cursor = conn.cursor()
+    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    conn.commit()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS document_store (
+            id serial PRIMARY KEY,
+            filename text,
+            content text,
+            embedding vector(768)
+        );
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-        # Batch generation of semantic embeddings via Ollama's dedicated embedding endpoint
-        print(f"[*] Compiling vector space matrices for {len(chunks)} document chunks using {self.embedding_model}...")
+init_db()
+
+class IngestPayload(BaseModel):
+    filename: str
+    text_content: str
+
+class QueryPayload(BaseModel):
+    prompt: str
+
+def chunk_text(text: str, chunk_size=500, chunk_overlap=100):
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = " ".join(words[i : i + chunk_size])
+        chunks.append(chunk)
+        i += chunk_size - chunk_overlap
+    return chunks
+
+@app.post("/ingest")
+async def ingest_document(payload: IngestPayload):
+    try:
+        chunks = chunk_text(payload.text_content)
+
+        conn = psycopg2.connect(**DB_PARAMS)
+        cursor = conn.cursor()
+        register_vector(conn)  # Registers explicit vector type casting parameters
+
         for chunk in chunks:
-            response = ollama.embed(model=self.embedding_model, input=chunk)
-            # Unpack payload variant across client versions
+            response = ollama.embed(model=EMBED_MODEL, input=chunk)
             vector = response['embeddings'][0] if 'embeddings' in response else response['embedding']
-            self.embeddings.append(vector)
 
-        # Convert internal list tracking to an efficient numpy matrix array
-        self.embeddings = np.array(self.embeddings)
-        print(f"[+] Ingestion vector compilation successful. Pipeline locked and loaded.")
+            cursor.execute(
+                "INSERT INTO document_store (filename, content, embedding) VALUES (%s, %s, %s);",
+                (payload.filename, chunk, vector)
+            )
 
-    def _cosine_similarity(self, vec_a, vec_b):
-        """Computes the dot product normalized by the L2 norm of the vectors."""
-        dot_product = np.dot(vec_a, vec_b)
-        norm_a = np.linalg.norm(vec_a)
-        norm_b = np.linalg.norm(vec_b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot_product / (norm_a * norm_b)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success", "chunks_ingested": len(chunks)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    def query(self, user_prompt: str, top_k: int = 3) -> str:
-        """Executes similarity verification against vectors, constructs context,
+@app.post("/query")
+async def query_pipeline(payload: QueryPayload):
+    try:
+        response = ollama.embed(model=EMBED_MODEL, input=payload.prompt)
+        query_vector = response['embeddings'][0] if 'embeddings' in response else response['embedding']
 
-        and streams response from the generative chat model.
-        """
-        if len(self.documents) == 0:
-            return "Pipeline Error: Vector database target is empty. Run ingest_data first."
+        conn = psycopg2.connect(**DB_PARAMS)
+        cursor = conn.cursor()
+        register_vector(conn)  # CRITICAL: Forces mapping translation parameters
 
-        # 1. Compile incoming user prompt into a coordinate using the SAME embedding matrix
-        prompt_res = ollama.embed(model=self.embedding_model, input=user_prompt)
-        prompt_vector = prompt_res['embeddings'][0] if 'embeddings' in prompt_res else prompt_res['embedding']
-        prompt_vector = np.array(prompt_vector)
+        # Pull top 3 slices closest to the calculated coordinate map
+        cursor.execute(
+            "SELECT content FROM document_store ORDER BY embedding <=> %s::vector LIMIT 3;",
+            (query_vector,)
+        )
+        records = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-        # 2. Iterate through vector matrices to determine highest spatial cosine similarity
-        scores = []
-        for doc_vector in self.embeddings:
-            score = self._cosine_similarity(prompt_vector, doc_vector)
-            scores.append(score)
+        if not records:
+            return {"answer": "No records found in database layers. Upload files first."}
 
-        # 3. Pull indices of top_k absolute matches
-        top_indices = np.argsort(scores)[::-1][:top_k]
+        context_payload = "\n---\n".join([row[0] for row in records])
 
-        # Assemble reference context block
-        context_blocks = [self.documents[idx] for idx in top_indices]
-        context_payload = "\n---\n".join(context_blocks)
-
-        # 4. Construct system context payload to isolate prompt leakage
         system_instructions = (
-            "You are an advanced technical intelligence assistant. You are given the following context blocks "
-            "extracted from system documentation. Synthesize an optimal answer to the user's prompt strictly "
-            "utilizing this verified context layer. If the context does not contain the information required, "
-            "state that clearly.\n\n"
+            "You are an advanced technical intelligence assistant. Synthesize an optimal answer "
+            "strictly utilizing this verified context layer. If the context is insufficient, state it clearly.\n\n"
             f"=== VERIFIED CONTEXT BLOCK ===\n{context_payload}\n==============================="
         )
 
-        # 5. Stream the model inference pass directly to stdout via the generative LLM
-        response_stream = ollama.chat(
-            model=self.llm_model,
+        chat_res = ollama.chat(
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_instructions},
-                {"role": "user", "content": user_prompt}
-            ],
-            stream=True
+                {"role": "user", "content": payload.prompt}
+            ]
         )
 
-        print(f"\n[Aarav-Inference-Engine]: ", end="")
-        full_response = ""
-        for chunk in response_stream:
-            content = chunk['message']['content']
-            print(content, end="", flush=True)
-            full_response += content
-        print("\n")
-        return full_response
+        return {"answer": chat_res['message']['content']}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- Execution Controller Execution Example ---
 if __name__ == "__main__":
-    # Ensure you ran: ollama pull nomic-embed-text
-    # Ensure you ran: ollama pull llama3.2
-    pipeline = LocalRAGPipeline(llm_model="llama3.2", embedding_model="nomic-embed-text")
-
-    print("=== Local RAG Pipeline Protocol Initialized ===")
-    choice = input("Select input source track - [1] Raw Text | [2] Local PDF File: ").strip()
-
-    if choice == "1":
-        text_input = input("\nPaste raw text data block: ")
-        pipeline.ingest_data(source_type="text", payload=text_input)
-    elif choice == "2":
-        pdf_path = input("\nEnter exact system path to target PDF: ").strip()
-        pipeline.ingest_data(source_type="pdf", payload=pdf_path)
-    else:
-        print("Invalid termination signal.")
-        exit()
-
-    # Enter conversational processing loop
-    print("\n--- Pipeline Active: Enter prompts or type 'exit' to terminate thread ---")
-    while True:
-        user_query = input("\nUser Prompt >> ")
-        if user_query.lower() in ['exit', 'quit']:
-            print("Disconnecting active tracking matrices.")
-            break
-        if not user_query.strip():
-            continue
-
-        pipeline.query(user_prompt=user_query, top_k=2)
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
