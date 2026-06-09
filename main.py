@@ -10,11 +10,11 @@ import ollama
 
 app = FastAPI(title="Aarav Local RAG Engine")
 
-# DB Configuration Parameters for Jio Allocation
+
 DB_PARAMS = {
     "dbname": "aarav_vector_db",
     "user": "postgres",
-    "password": "",  # Set your password if configured
+    "password": "",  
     "host": "localhost",
     "port": "5432"
 }

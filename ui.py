@@ -13,40 +13,88 @@ app_mode = strl.sidebar.radio("Select Processing Interface", ["Document Ingestio
 # --- MODE 1: DOCUMENT INGESTION CONSOLE ---
 if app_mode == "Document Ingestion Workspace":
     strl.title("🗂 Document Ingestion & Spatial Embedding Console")
-    strl.write("Parse arbitrary native digital PDF files and compile their contents into the local `pgvector` store.")
-    
-    uploaded_file = strl.file_uploader("Upload Target PDF Document", type=["pdf"])
-    
-    if uploaded_file is not None:
-        strl.success(f"File handle loaded successfully: {uploaded_file.name}")
-        
-        if strl.button("Compile & Generate Embeddings"):
-            with strl.spinner("[*] Extracting digital character tracking streams..."):
-                try:
-                    # Extract text from uploaded PDF memory stream
-                    reader = PdfReader(uploaded_file)
-                    extracted_text = []
-                    for page in reader.pages:
-                        text = page.extract_text()
-                        if text:
-                            extracted_text.append(text)
-                    
-                    full_raw_text = "\n".join(extracted_text)
-                    
-                    if not full_raw_text.strip():
-                        strl.error("Extraction error: File contains zero token sequences or is an un-OCRed image scan.")
-                    else:
-                        # Push payload to backend API
-                        payload = {"filename": uploaded_file.name, "text_content": full_raw_text}
-                        response = requests.post(f"{BACKEND_API}/ingest", json=payload)
-                        
-                        if response.status_code == 200:
-                            data = response.json()
-                            strl.success(f"[+] Ingestion vector compilation successful. Wrote {data['chunks_ingested']} context blocks to pgvector.")
-                        else:
-                            strl.error(f"API rejection error: {response.text}")
-                except Exception as e:
-                    strl.error(f"Execution pipeline structural failure: {str(e)}")
+    strl.write("Upload a PDF document or paste raw text to compile context into the local `pgvector` store.")
+
+    # Two-column layout: PDF upload on the left, text input on the right
+    col_pdf, col_text = strl.columns(2)
+
+    with col_pdf:
+        strl.subheader("Upload PDF Document")
+        uploaded_file = strl.file_uploader("Upload Target PDF Document", type=["pdf"], label_visibility="collapsed")
+        if uploaded_file is not None:
+            strl.success(f"File loaded: {uploaded_file.name}")
+
+    with col_text:
+        strl.subheader("Paste Raw Text")
+        manual_text = strl.text_area(
+            "Paste context text here",
+            height=200,
+            placeholder="Paste textbook passages, notes, or any reference material here...",
+            label_visibility="collapsed"
+        )
+        manual_text_name = strl.text_input(
+            "Label for this text (used as filename in the database)",
+            placeholder="e.g. chapter1_notes",
+            value=""
+        )
+
+    strl.divider()
+
+    if strl.button("Compile & Generate Embeddings", type="primary"):
+        sources_queued = []
+
+        # Collect PDF source
+        if uploaded_file is not None:
+            sources_queued.append(("pdf", uploaded_file))
+
+        # Collect manual text source
+        if manual_text.strip():
+            label = manual_text_name.strip() if manual_text_name.strip() else "manual_text_input"
+            sources_queued.append(("text", (label, manual_text)))
+
+        if not sources_queued:
+            strl.warning("No input provided. Upload a PDF or paste text before compiling.")
+        else:
+            for source_type, source_data in sources_queued:
+                if source_type == "pdf":
+                    with strl.spinner(f"[*] Extracting text from {source_data.name}..."):
+                        try:
+                            # Extract text from uploaded PDF memory stream
+                            reader = PdfReader(source_data)
+                            extracted_text = []
+                            for page in reader.pages:
+                                text = page.extract_text()
+                                if text:
+                                    extracted_text.append(text)
+
+                            full_raw_text = "\n".join(extracted_text)
+
+                            if not full_raw_text.strip():
+                                strl.error(f"Extraction error for {source_data.name}: File contains zero token sequences or is an un-OCRed image scan.")
+                            else:
+                                payload = {"filename": source_data.name, "text_content": full_raw_text}
+                                response = requests.post(f"{BACKEND_API}/ingest", json=payload)
+                                if response.status_code == 200:
+                                    data = response.json()
+                                    strl.success(f"[+] PDF '{source_data.name}' ingested. Wrote {data['chunks_ingested']} context blocks to pgvector.")
+                                else:
+                                    strl.error(f"API rejection error for PDF: {response.text}")
+                        except Exception as e:
+                            strl.error(f"PDF pipeline failure: {str(e)}")
+
+                elif source_type == "text":
+                    label, raw_text = source_data
+                    with strl.spinner(f"[*] Ingesting text block '{label}'..."):
+                        try:
+                            payload = {"filename": label, "text_content": raw_text}
+                            response = requests.post(f"{BACKEND_API}/ingest", json=payload)
+                            if response.status_code == 200:
+                                data = response.json()
+                                strl.success(f"[+] Text '{label}' ingested. Wrote {data['chunks_ingested']} context blocks to pgvector.")
+                            else:
+                                strl.error(f"API rejection error for text: {response.text}")
+                        except Exception as e:
+                            strl.error(f"Text pipeline failure: {str(e)}")
 
 # --- MODE 2: CONVERSATIONAL CHAT APPLICATION ---
 elif app_mode == "Conversational Chat Pipeline":
