@@ -3,6 +3,7 @@ import subprocess
 import time
 import socket
 import json
+import math
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -95,6 +96,21 @@ class SpatialFramePayload(BaseModel):
     camera_extrinsics_rt: List[List[float]] # 3x4 or 4x4 matrix transformation rows
     detected_objects: List[BoundingBox3D]
 
+# Added validation model to support incoming parameters from the UI dataset bridge
+class DatasetBridgePayload(BaseModel):
+    source_dataset: str
+    scene_id: str
+    frame_timestamp: float
+    ego_translation: List[float]
+    ego_velocity_vector: List[float]
+    target_classification: str
+    target_id: int
+    box_translation: List[float]
+    box_size_lwh: List[float]
+    orientation_parameter: List[float]
+    target_velocity_vector: List[float]
+    occlusion_state: str
+
 class QueryPayload(BaseModel):
     prompt: str
 
@@ -155,7 +171,6 @@ async def ingest_spatial_telemetry(payload: SpatialFramePayload):
                 payload.frame_timestamp,
                 payload.ego_velocity_vector,
                 json.dumps(payload.dict()),
-                spatial_vector
             )
         )
 
@@ -168,6 +183,41 @@ async def ingest_spatial_telemetry(payload: SpatialFramePayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# New Endpoint implementation to fix the 404 error
+@app.post("/ingest/dataset-bridge")
+async def ingest_through_dataset_bridge(payload: DatasetBridgePayload):
+    try:
+        # 1. Coordinate Normalization (Absolute World Pos -> Local Relative to Ego)
+        relative_center = [
+            payload.box_translation[0] - payload.ego_translation[0],
+            payload.box_translation[1] - payload.ego_translation[1],
+            payload.box_translation[2] - payload.ego_translation[2]
+        ]
+
+        # 2. Re-wrap into native internal layout schema
+        normalized_box = BoundingBox3D(
+            target_id=payload.target_id,
+            classification=payload.target_classification,
+            center_xyz=relative_center,
+            extent_lwh=payload.box_size_lwh,
+            velocity_vector=payload.target_velocity_vector,
+            occlusion_state=payload.occlusion_state
+        )
+
+        native_payload = SpatialFramePayload(
+            scene_id=payload.scene_id,
+            frame_timestamp=payload.frame_timestamp,
+            ego_velocity_vector=payload.ego_velocity_vector,
+            camera_extrinsics_rt=[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+            detected_objects=[normalized_box]
+        )
+
+        # 3. Direct pass-through execution into vector serialization loop
+        return await ingest_spatial_telemetry(native_payload)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dataset Transformation Exception: {str(e)}")
 
 @app.post("/query/scenario")
 async def query_scenario_pipeline(payload: QueryPayload):
@@ -223,21 +273,22 @@ async def query_scenario_pipeline(payload: QueryPayload):
         context_payload = "\n---\n".join(context_blocks)
 
         # Rigidly lock down the small LLM's role to prevent semantic merging and field re-writing
+ # Rigidly lock down the small LLM's role to prevent semantic merging and field re-writing
         system_instructions = (
-            "You are a deterministic Autonomous Vehicle Data Extraction Component. You do not reason or theorize, "
-            "you do not correct source classifications, and you never guess properties.\n\n"
+            "You are a deterministic Autonomous Vehicle Data Extraction Component.\n"
             "CRITICAL COMMANDS:\n"
-            "1. Output ONLY exact parameters directly printed in the OBJECT LOGS context. If a target is logged as a motorcycle, "
-            "write its classification explicitly as motorcycle. NEVER alter it or label it as a pedestrian.\n"
-            "2. Keep numeric values completely intact. If velocities are logged as meters per second, output them in m/s, never mph.\n"
-            "3. Do not cross-contaminate properties. Keep every target ID perfectly mapped to its own structural location vectors.\n"
-            "4. For the single closest object matching the user query prompt constraints, output its tracking parameter block using "
-            "this exact markdown notation:\n"
+            "1. Output ONLY exact parameters directly printed in the OBJECT LOGS context.\n"
+            "2. Keep numeric values completely intact. Never alter them.\n"
+            "3. Do NOT include conversational notes, greetings, explanations, or introductory text.\n"
+            "4. You MUST format the output exactly like the following markdown template block, filling in the bracketed properties:\n\n"
             "$$x = [X, Y, V_x, V_y]^T$$\n"
-            "followed by the exact numbers from that specific target's log file entry lines.\n\n"
+            "- Target ID: [target_id]\n"
+            "- Classification: [classification]\n"
+            "- Relative Position: X: [X], Y: [Y], Z: [Z]\n"
+            "- Velocity Vectors: Vx: [Vx], Vy: [Vy]\n"
+            "- Visibility State: [occlusion_state]\n\n"
             f"=== RETRIEVED TELEMETRY CONTEXT BANDS ===\n{context_payload}\n========================================="
         )
-
         chat_res = ollama.chat(
             model=LLM_MODEL,
             messages=[
