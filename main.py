@@ -11,7 +11,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import psycopg2
 from pgvector.psycopg2 import register_vector
-import ollama
+# import ollama
+from sentence_transformers import SentenceTransformer
 
 app = FastAPI(title="Spatial Telemetry Engine", description="Local 3D Scene Discovery & Volumetric Retrieval Platform")
 
@@ -24,38 +25,46 @@ DB_PARAMS = {
     "port": "5432"
 }
 
-LLM_MODEL = "llama3.2"
-EMBED_MODEL = "nomic-embed-text"
+# LLM_MODEL = "llama3.2"
+# EMBED_MODEL = "nomic-embed-text"
 
-def bootstrap_ollama():
-    """Checks if the local Ollama port is open. If closed, automates engine boot."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        is_running = s.connect_ex(('127.0.0.1', 11434)) == 0
+# --- High-Velocity Native Local Embedding Layer ---
+SPATIAL_EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
 
-    if not is_running:
-        print("[*] Ollama daemon is offline. Initializing automatic background boot thread...")
-        try:
-            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(3)  # Allow time slice for socket allocation
-        except Exception as e:
-            print(f"[-] Auto-boot failed. Attempting alternative systemd invoke: {e}")
-            subprocess.Popen(["sudo", "systemctl", "start", "ollama"])
-            time.sleep(3)
+def get_spatial_embedding(text_payload: str):
+    """Generates dense vector matrices instantly on local hardware."""
+    vector_array = SPATIAL_EMBEDDER.encode(text_payload)
+    return vector_array.tolist()
 
-    try:
-        local_models = [m['model'] for m in ollama.list().get('models', [])]
-        if f"{EMBED_MODEL}:latest" not in local_models and EMBED_MODEL not in local_models:
-            print(f"[*] Fetching required embedding matrix: {EMBED_MODEL}")
-            ollama.pull(EMBED_MODEL)
-        if f"{LLM_MODEL}:latest" not in local_models and LLM_MODEL not in local_models:
-            print(f"[*] Fetching required synthesis matrix: {LLM_MODEL}")
-            ollama.pull(LLM_MODEL)
-        print("[+] Ollama execution layer online and verified.")
-    except Exception as e:
-        print(f"[-] Target verification error: {e}. Confirm manually via 'ollama list'")
-
-# Fire daemon automation layer
-bootstrap_ollama()
+# def bootstrap_ollama():
+#     """Checks if the local Ollama port is open. If closed, automates engine boot."""
+#     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#         is_running = s.connect_ex(('127.0.0.1', 11434)) == 0
+# 
+#     if not is_running:
+#         print("[*] Ollama daemon is offline. Initializing automatic background boot thread...")
+#         try:
+#             subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+#             time.sleep(3)  # Allow time slice for socket allocation
+#         except Exception as e:
+#             print(f"[-] Auto-boot failed. Attempting alternative systemd invoke: {e}")
+#             subprocess.Popen(["sudo", "systemctl", "start", "ollama"])
+#             time.sleep(3)
+# 
+#     try:
+#         local_models = [m['model'] for m in ollama.list().get('models', [])]
+#         if f"{EMBED_MODEL}:latest" not in local_models and EMBED_MODEL not in local_models:
+#             print(f"[*] Fetching required embedding matrix: {EMBED_MODEL}")
+#             ollama.pull(EMBED_MODEL)
+#         if f"{LLM_MODEL}:latest" not in local_models and LLM_MODEL not in local_models:
+#             print(f"[*] Fetching required synthesis matrix: {LLM_MODEL}")
+#             ollama.pull(LLM_MODEL)
+#         print("[+] Ollama execution layer online and verified.")
+#     except Exception as e:
+#         print(f"[-] Target verification error: {e}. Confirm manually via 'ollama list'")
+# 
+# # Fire daemon automation layer
+# bootstrap_ollama()
 
 def init_db():
     """Initializes extension registers and spatial telemetry store tables."""
@@ -65,6 +74,7 @@ def init_db():
     conn.commit()
 
     # Mutate table schema to explicitly hold structural physical states
+    # Note: Vector dimensions dropped to 384 to mirror all-MiniLM-L6-v2 footprints
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS spatial_scene_store (
             id serial PRIMARY KEY,
@@ -72,7 +82,7 @@ def init_db():
             frame_timestamp real NOT NULL,
             ego_velocity_vector real[] NOT NULL,
             raw_telemetry_json jsonb NOT NULL,
-            spatial_geometry_embedding vector(768)
+            spatial_geometry_embedding vector(384)
         );
     """)
     conn.commit()
@@ -142,21 +152,22 @@ def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
 # --- Asynchronous Worker Logic ---
 
 def process_and_store_telemetry(payload: SpatialFramePayload):
-    """Background task function handling serialization, embedding, and DB insertion."""
+    """Background task function handling serialization, native embedding, and DB insertion."""
     try:
         serialized_context = serialize_spatial_frame(payload)
 
-        # Generate spatial feature embedding coordinates
-        response = ollama.embed(model=EMBED_MODEL, input=serialized_context)
-        
-        # Defensive validation loop to clean single vs multi-sequence outputs
-        if 'embeddings' in response and response['embeddings']:
-            spatial_vector = response['embeddings'][0]
-        elif 'embedding' in response:
-            spatial_vector = response['embedding']
-        else:
-            print("[-] Critical Error: Ollama output missing valid vector matrix types.")
-            return
+        # Generate spatial feature embedding coordinates via native sentence-transformers
+        spatial_vector = get_spatial_embedding(serialized_context)
+
+        # --- Old Ollama Ingestion Code Block ---
+        # response = ollama.embed(model=EMBED_MODEL, input=serialized_context)
+        # if 'embeddings' in response and response['embeddings']:
+        #     spatial_vector = response['embeddings'][0]
+        # elif 'embedding' in response:
+        #     spatial_vector = response['embedding']
+        # else:
+        #     print("[-] Critical Error: Ollama output missing valid vector matrix types.")
+        #     return
 
         conn = psycopg2.connect(**DB_PARAMS)
         cursor = conn.cursor()
@@ -237,14 +248,11 @@ def extract_state_vector(llm_text: str) -> Optional[List[float]]:
     Parses strict LaTeX state-space arrays from local LLM context blocks.
     Falls back to explicit text parameter scanning if the math block contains literal placeholders.
     """
-    import re
-    
     # Pass 1: Standard LaTeX check for active digit arrays: x = [1.2, 3.4, ...]^T
     math_pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)(?:,\s*(-?\d+(?:\.\d+)?))?\s*\]\^T"
     match = re.search(math_pattern, llm_text)
     if match:
         extracted = [float(c) for c in match.groups() if c is not None]
-        # Return only if it contains real parsed values, not literal text characters
         if extracted:
             return extracted
 
@@ -269,12 +277,15 @@ def extract_state_vector(llm_text: str) -> Optional[List[float]]:
 @app.post("/query/scenario")
 async def query_scenario_pipeline(payload: QueryPayload):
     try:
-        response = ollama.embed(model=EMBED_MODEL, input=payload.prompt)
-        
-        if 'embeddings' in response and response['embeddings']:
-            query_vector = response['embeddings'][0]
-        else:
-            query_vector = response['embedding']
+        # Generate dense prompt vector directly on local hardware via Sentence Transformers
+        query_vector = get_spatial_embedding(payload.prompt)
+
+        # --- Old Ollama Query Code Block ---
+        # response = ollama.embed(model=EMBED_MODEL, input=payload.prompt)
+        # if 'embeddings' in response and response['embeddings']:
+        #     query_vector = response['embeddings'][0]
+        # else:
+        #     query_vector = response['embedding']
 
         conn = psycopg2.connect(**DB_PARAMS)
         cursor = conn.cursor()
@@ -340,8 +351,12 @@ async def query_scenario_pipeline(payload: QueryPayload):
             "- Visibility State: [occlusion_state]\n\n"
             f"=== RETRIEVED TELEMETRY CONTEXT BANDS ===\n{context_payload}\n========================================="
         )        
+        
+        # NOTE: Leaving this here as it requires an active, responding local llama-server instance.
+        # If your local Ollama daemon hangs or times out on ROCm, substitute this with a remote Groq endpoint.
+        import ollama
         chat_res = ollama.chat(
-            model=LLM_MODEL,
+            model="llama3.2",
             messages=[
                 {"role": "system", "content": system_instructions},
                 {"role": "user", "content": payload.prompt}
