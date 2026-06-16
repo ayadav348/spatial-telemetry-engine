@@ -233,11 +233,37 @@ async def ingest_through_dataset_bridge(payload: DatasetBridgePayload, backgroun
         raise HTTPException(status_code=500, detail=f"Dataset Transformation Exception: {str(e)}")
 
 def extract_state_vector(llm_text: str) -> Optional[List[float]]:
-    """Parses strict LaTeX state-space string arrays from local LLM context blocks."""
-    pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)(?:,\s*(-?\d+(?:\.\d+)?))?\s*\]\^T"
-    match = re.search(pattern, llm_text)
+    """
+    Parses strict LaTeX state-space arrays from local LLM context blocks.
+    Falls back to explicit text parameter scanning if the math block contains literal placeholders.
+    """
+    import re
+    
+    # Pass 1: Standard LaTeX check for active digit arrays: x = [1.2, 3.4, ...]^T
+    math_pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)(?:,\s*(-?\d+(?:\.\d+)?))?\s*\]\^T"
+    match = re.search(math_pattern, llm_text)
     if match:
-        return [float(coordinate) for coordinate in match.groups() if coordinate is not None]
+        extracted = [float(c) for c in match.groups() if c is not None]
+        # Return only if it contains real parsed values, not literal text characters
+        if extracted:
+            return extracted
+
+    # Pass 2: Fallback Parameter Extraction (Scans the rigid bullet points populated by the LLM)
+    try:
+        x_match = re.search(r"Relative Position:\s*X:\s*\[?(-?\d+(?:\.\d+)?)\]?", llm_text)
+        y_match = re.search(r"Relative Position:.*?Y:\s*\[?(-?\d+(?:\.\d+)?)\]?", llm_text)
+        vx_match = re.search(r"Velocity Vectors:\s*Vx:\s*\[?(-?\d+(?:\.\d+)?)\]?", llm_text)
+        vy_match = re.search(r"Velocity Vectors:.*?Vy:\s*\[?(-?\d+(?:\.\d+)?)\]?", llm_text)
+
+        if x_match and y_match and vx_match:
+            x = float(x_match.group(1))
+            y = float(y_match.group(1))
+            vx = float(vx_match.group(1))
+            vy = float(vy_match.group(1)) if vy_match else 0.0
+            return [x, y, vx, vy]
+    except Exception as e:
+        print(f"[-] Regex parameter fallback exception: {e}")
+
     return None
 
 @app.post("/query/scenario")
