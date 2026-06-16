@@ -4,8 +4,10 @@ import time
 import socket
 import json
 import math
+import re
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -79,7 +81,7 @@ def init_db():
 
 init_db()
 
-# --- Pydantic Validation Models for Structural Telemetry Ingestion (V2 Standards Complete) ---
+# --- Pydantic Validation Models for Structural Telemetry Ingestion ---
 
 class BoundingBox3D(BaseModel):
     target_id: int
@@ -96,7 +98,6 @@ class SpatialFramePayload(BaseModel):
     camera_extrinsics_rt: List[List[float]] # 3x4 or 4x4 matrix transformation rows
     detected_objects: List[BoundingBox3D]
 
-# Added validation model to support incoming parameters from the UI dataset bridge
 class DatasetBridgePayload(BaseModel):
     source_dataset: str
     scene_id: str
@@ -117,19 +118,14 @@ class QueryPayload(BaseModel):
 # --- Spatial Math Serialization Utility ---
 
 def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
-    """
-    Converts multi-dimensional matrix inputs and coordinate tracking telemetry
-    into a dense structural string representation for the embedding layer.
-    """
+    """Converts multi-dimensional matrix inputs and coordinate tracking telemetry into a string representation."""
     ego_speed = (sum(v**2 for v in payload.ego_velocity_vector))**0.5
 
-    # Base structural metadata anchor
     structural_string = (
         f"Sequence frame token: {payload.scene_id}. Physical Timestamp offsets: {payload.frame_timestamp:.3f}s. "
         f"Ego vehicle linear velocity state magnitude: {ego_speed:.2f} m/s. "
     )
 
-    # Serialize target bounding box trajectories relative to ego origin
     for idx, box in enumerate(payload.detected_objects):
         distance_euclidean = (sum(c**2 for c in box.center_xyz))**0.5
         structural_string += (
@@ -143,23 +139,29 @@ def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
 
     return structural_string
 
-# --- REST Endpoints ---
+# --- Asynchronous Worker Logic ---
 
-@app.post("/ingest/spatial")
-async def ingest_spatial_telemetry(payload: SpatialFramePayload):
+def process_and_store_telemetry(payload: SpatialFramePayload):
+    """Background task function handling serialization, embedding, and DB insertion."""
     try:
-        # Convert raw numerical matrices into a dense semantic topology map
         serialized_context = serialize_spatial_frame(payload)
 
         # Generate spatial feature embedding coordinates
         response = ollama.embed(model=EMBED_MODEL, input=serialized_context)
-        spatial_vector = response['embeddings'][0] if 'embeddings' in response else response['embedding']
+        
+        # Defensive validation loop to clean single vs multi-sequence outputs
+        if 'embeddings' in response and response['embeddings']:
+            spatial_vector = response['embeddings'][0]
+        elif 'embedding' in response:
+            spatial_vector = response['embedding']
+        else:
+            print("[-] Critical Error: Ollama output missing valid vector matrix types.")
+            return
 
         conn = psycopg2.connect(**DB_PARAMS)
         cursor = conn.cursor()
         register_vector(conn)
 
-        # Store explicit spatial variables alongside raw structural jsonb tracking logs
         cursor.execute(
             """
             INSERT INTO spatial_scene_store
@@ -171,31 +173,37 @@ async def ingest_spatial_telemetry(payload: SpatialFramePayload):
                 payload.frame_timestamp,
                 payload.ego_velocity_vector,
                 json.dumps(payload.dict()),
+                spatial_vector
             )
         )
 
         conn.commit()
         cursor.close()
         conn.close()
-
-        print(f"[+] Successfully indexed tracking metrics for sequence frame: {payload.scene_id}")
-        return {"status": "success", "scene_indexed": payload.scene_id, "frame_timestamp": payload.frame_timestamp}
-
+        print(f"[+] Asynchronously indexed tracking metrics for sequence frame: {payload.scene_id}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[-] Background Ingestion Thread Exception: {str(e)}")
 
-# New Endpoint implementation to fix the 404 error
-@app.post("/ingest/dataset-bridge")
-async def ingest_through_dataset_bridge(payload: DatasetBridgePayload):
+# --- REST Endpoints ---
+
+@app.post("/ingest/spatial", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_spatial_telemetry(payload: SpatialFramePayload, background_tasks: BackgroundTasks):
+    background_tasks.add_task(process_and_store_telemetry, payload)
+    return {
+        "status": "QUEUED",
+        "scene_id": payload.scene_id,
+        "detail": "Spatial extraction processing initiated on worker thread loop."
+    }
+
+@app.post("/ingest/dataset-bridge", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_through_dataset_bridge(payload: DatasetBridgePayload, background_tasks: BackgroundTasks):
     try:
-        # 1. Coordinate Normalization (Absolute World Pos -> Local Relative to Ego)
         relative_center = [
             payload.box_translation[0] - payload.ego_translation[0],
             payload.box_translation[1] - payload.ego_translation[1],
             payload.box_translation[2] - payload.ego_translation[2]
         ]
 
-        # 2. Re-wrap into native internal layout schema
         normalized_box = BoundingBox3D(
             target_id=payload.target_id,
             classification=payload.target_classification,
@@ -213,24 +221,39 @@ async def ingest_through_dataset_bridge(payload: DatasetBridgePayload):
             detected_objects=[normalized_box]
         )
 
-        # 3. Direct pass-through execution into vector serialization loop
-        return await ingest_spatial_telemetry(native_payload)
-
+        background_tasks.add_task(process_and_store_telemetry, native_payload)
+        
+        return {
+            "status": "QUEUED",
+            "source_dataset": payload.source_dataset,
+            "scene_id": payload.scene_id,
+            "detail": "Dataset bridge parsing complete. Ingestion job offloaded to background loop."
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Dataset Transformation Exception: {str(e)}")
+
+def extract_state_vector(llm_text: str) -> Optional[List[float]]:
+    """Parses strict LaTeX state-space string arrays from local LLM context blocks."""
+    pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)(?:,\s*(-?\d+(?:\.\d+)?))?\s*\]\^T"
+    match = re.search(pattern, llm_text)
+    if match:
+        return [float(coordinate) for coordinate in match.groups() if coordinate is not None]
+    return None
 
 @app.post("/query/scenario")
 async def query_scenario_pipeline(payload: QueryPayload):
     try:
-        # Embed the spatial tracking constraint request
         response = ollama.embed(model=EMBED_MODEL, input=payload.prompt)
-        query_vector = response['embeddings'][0] if 'embeddings' in response else response['embedding']
+        
+        if 'embeddings' in response and response['embeddings']:
+            query_vector = response['embeddings'][0]
+        else:
+            query_vector = response['embedding']
 
         conn = psycopg2.connect(**DB_PARAMS)
         cursor = conn.cursor()
         register_vector(conn)
 
-        # Query the database for the 3 closest spatial layouts using cosine distance
         cursor.execute(
             """
             SELECT scene_id, frame_timestamp, raw_telemetry_json
@@ -245,9 +268,12 @@ async def query_scenario_pipeline(payload: QueryPayload):
         conn.close()
 
         if not records:
-            return {"answer": "No indexed scene matrices discovered in spatial database layers."}
+            return {
+                "answer": "No indexed scene matrices discovered in spatial database layers.",
+                "state_vector_seed": None,
+                "status": "EMPTY_DATABASE"
+            }
 
-        # Build context payloads by isolating individual target properties into an explicit schema map
         context_blocks = []
         for row in records:
             scene_id = row[0]
@@ -272,15 +298,14 @@ async def query_scenario_pipeline(payload: QueryPayload):
 
         context_payload = "\n---\n".join(context_blocks)
 
-        # Rigidly lock down the small LLM's role to prevent semantic merging and field re-writing
- # Rigidly lock down the small LLM's role to prevent semantic merging and field re-writing
         system_instructions = (
             "You are a deterministic Autonomous Vehicle Data Extraction Component.\n"
             "CRITICAL COMMANDS:\n"
             "1. Output ONLY exact parameters directly printed in the OBJECT LOGS context.\n"
             "2. Keep numeric values completely intact. Never alter them.\n"
             "3. Do NOT include conversational notes, greetings, explanations, or introductory text.\n"
-            "4. You MUST format the output exactly like the following markdown template block, filling in the bracketed properties:\n\n"
+            "4. You MUST format the output exactly like the following markdown template block, filling in the bracketed properties.\n"
+            "5. The state vector array inside the brackets MUST contain EXACTLY four numeric values: [X, Y, Vx, Vy]. If Vy is missing, pad it with 0.0:\n\n"
             "$$x = [X, Y, V_x, V_y]^T$$\n"
             "- Target ID: [target_id]\n"
             "- Classification: [classification]\n"
@@ -288,7 +313,7 @@ async def query_scenario_pipeline(payload: QueryPayload):
             "- Velocity Vectors: Vx: [Vx], Vy: [Vy]\n"
             "- Visibility State: [occlusion_state]\n\n"
             f"=== RETRIEVED TELEMETRY CONTEXT BANDS ===\n{context_payload}\n========================================="
-        )
+        )        
         chat_res = ollama.chat(
             model=LLM_MODEL,
             messages=[
@@ -297,7 +322,14 @@ async def query_scenario_pipeline(payload: QueryPayload):
             ]
         )
 
-        return {"answer": chat_res['message']['content']}
+        raw_llm_output = chat_res['message']['content']
+        extracted_seed = extract_state_vector(raw_llm_output)
+
+        return {
+            "answer": raw_llm_output,
+            "state_vector_seed": extracted_seed,
+            "status": "SUCCESS" if extracted_seed else "METRIC_EXTRACTION_FAILED"
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
