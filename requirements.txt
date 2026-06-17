@@ -1,15 +1,19 @@
-fastapi>=0.136.0
-uvicorn>=0.49.0
+# --- API Backend (main.py) ---
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.7.0
 psycopg2-binary>=2.9.10
-pgvector>=0.3.0
-ollama>=0.4.0
-pypdf>=5.0.0
+pgvector>=0.3.6
+sentence-transformers>=3.0.0
+
+# --- Streamlit UI (ui.py) ---
 streamlit>=1.40.0
 requests>=2.32.0
 
-# --- Mandatory Ingestion & Verification Layers ---
-pydantic>=2.7.0         # Crucial: Enforces your BoundingBox3D & SpatialFramePayload schemas
-pydantic-settings>=2.2.0 # Manages your local DB_PARAMS and EMBED_MODEL configurations smoothly
+# --- Dataset Bridge & Benchmarking (dataset_bridge.py, benchmark_pipeline.py) ---
+numpy>=1.26.0
+httpx>=0.27.0
 
-# --- Data Serialization Optimization ---
-numpy>=1.26.0           # Optimizes multi-dimensional array slicing if you import heavy datasets later
+# --- Optional: LLM query synthesis via /query/scenario endpoint ---
+# Requires a running Ollama daemon with llama3.2 pulled (ollama pull llama3.2)
+ollama>=0.4.0
