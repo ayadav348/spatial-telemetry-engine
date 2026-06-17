@@ -13,7 +13,6 @@ import psycopg2
 from pgvector.psycopg2 import register_vector
 # import ollama
 from sentence_transformers import SentenceTransformer
-
 app = FastAPI(title="Spatial Telemetry Engine", description="Local 3D Scene Discovery & Volumetric Retrieval Platform")
 
 # Configured to target your newly initialized PostgreSQL layer
@@ -65,16 +64,16 @@ def get_spatial_embedding(text_payload: str):
 # 
 # # Fire daemon automation layer
 # bootstrap_ollama()
-
 def init_db():
     """Initializes extension registers and spatial telemetry store tables."""
     conn = psycopg2.connect(**DB_PARAMS)
     cursor = conn.cursor()
+    
+    # Enable the pgvector extension
     cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
     conn.commit()
 
     # Mutate table schema to explicitly hold structural physical states
-    # Note: Vector dimensions dropped to 384 to mirror all-MiniLM-L6-v2 footprints
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS spatial_scene_store (
             id serial PRIMARY KEY,
@@ -89,7 +88,25 @@ def init_db():
     cursor.close()
     conn.close()
 
-init_db()
+@app.on_event("startup")
+def startup_event():    
+    # FIX STEP 1: Always guarantee table schema creation exists FIRST
+    init_db()
+    
+    # FIX STEP 2: Open a dedicated, valid connection context for the wipeout routine
+    print("[Database Initializer] Establishing connection matrix for initialization...")
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        with conn.cursor() as cur:
+            # FIX STEP 3: Safely execute wipeout now that table structure is guaranteed
+            cur.execute("TRUNCATE TABLE spatial_scene_store RESTART IDENTITY;")
+            conn.commit()
+            print("[Database Initializer] Stale telemetry frames purged. DB is clean!")
+        conn.close()
+    except Exception as e:
+        print(f"[-] Startup Database Reset Failed: {e}")
+
+
 
 # --- Pydantic Validation Models for Structural Telemetry Ingestion ---
 
