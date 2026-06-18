@@ -11,11 +11,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import psycopg2
 from pgvector.psycopg2 import register_vector
-# import ollama
 from sentence_transformers import SentenceTransformer
+
 app = FastAPI(title="Spatial Telemetry Engine", description="Local 3D Scene Discovery & Volumetric Retrieval Platform")
 
-# Configured to target your newly initialized PostgreSQL layer
 DB_PARAMS = {
     "dbname": "spatial_vector_db",
     "user": "postgres",
@@ -24,10 +23,7 @@ DB_PARAMS = {
     "port": "5432"
 }
 
-# LLM_MODEL = "llama3.2"
-# EMBED_MODEL = "nomic-embed-text"
-
-# --- High-Velocity Native Local Embedding Layer ---
+# High-Velocity Native Local Embedding Layer
 SPATIAL_EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
 
 def get_spatial_embedding(text_payload: str):
@@ -35,45 +31,13 @@ def get_spatial_embedding(text_payload: str):
     vector_array = SPATIAL_EMBEDDER.encode(text_payload)
     return vector_array.tolist()
 
-# def bootstrap_ollama():
-#     """Checks if the local Ollama port is open. If closed, automates engine boot."""
-#     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-#         is_running = s.connect_ex(('127.0.0.1', 11434)) == 0
-# 
-#     if not is_running:
-#         print("[*] Ollama daemon is offline. Initializing automatic background boot thread...")
-#         try:
-#             subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-#             time.sleep(3)  # Allow time slice for socket allocation
-#         except Exception as e:
-#             print(f"[-] Auto-boot failed. Attempting alternative systemd invoke: {e}")
-#             subprocess.Popen(["sudo", "systemctl", "start", "ollama"])
-#             time.sleep(3)
-# 
-#     try:
-#         local_models = [m['model'] for m in ollama.list().get('models', [])]
-#         if f"{EMBED_MODEL}:latest" not in local_models and EMBED_MODEL not in local_models:
-#             print(f"[*] Fetching required embedding matrix: {EMBED_MODEL}")
-#             ollama.pull(EMBED_MODEL)
-#         if f"{LLM_MODEL}:latest" not in local_models and LLM_MODEL not in local_models:
-#             print(f"[*] Fetching required synthesis matrix: {LLM_MODEL}")
-#             ollama.pull(LLM_MODEL)
-#         print("[+] Ollama execution layer online and verified.")
-#     except Exception as e:
-#         print(f"[-] Target verification error: {e}. Confirm manually via 'ollama list'")
-# 
-# # Fire daemon automation layer
-# bootstrap_ollama()
 def init_db():
     """Initializes extension registers and spatial telemetry store tables."""
     conn = psycopg2.connect(**DB_PARAMS)
     cursor = conn.cursor()
-    
-    # Enable the pgvector extension
     cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
     conn.commit()
 
-    # Mutate table schema to explicitly hold structural physical states
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS spatial_scene_store (
             id serial PRIMARY KEY,
@@ -90,15 +54,11 @@ def init_db():
 
 @app.on_event("startup")
 def startup_event():    
-    # FIX STEP 1: Always guarantee table schema creation exists FIRST
     init_db()
-    
-    # FIX STEP 2: Open a dedicated, valid connection context for the wipeout routine
     print("[Database Initializer] Establishing connection matrix for initialization...")
     try:
         conn = psycopg2.connect(**DB_PARAMS)
         with conn.cursor() as cur:
-            # FIX STEP 3: Safely execute wipeout now that table structure is guaranteed
             cur.execute("TRUNCATE TABLE spatial_scene_store RESTART IDENTITY;")
             conn.commit()
             print("[Database Initializer] Stale telemetry frames purged. DB is clean!")
@@ -106,23 +66,36 @@ def startup_event():
     except Exception as e:
         print(f"[-] Startup Database Reset Failed: {e}")
 
+# --- Metrics Verification Endpoint ---
+@app.get("/db/stats")
+def get_db_stats():
+    """Returns database telemetry frame counts to verify initialization wiping."""
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM spatial_scene_store;")
+        count = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        return {"frame_count": count}
+    except Exception as e:
+        return {"frame_count": -1, "error": str(e)}
 
-
-# --- Pydantic Validation Models for Structural Telemetry Ingestion ---
+# --- Pydantic Validation Models ---
 
 class BoundingBox3D(BaseModel):
     target_id: int
     classification: str
-    center_xyz: List[float] = Field(..., min_length=3, max_length=3)  # [X, Y, Z] relative coordinates
-    extent_lwh: List[float] = Field(..., min_length=3, max_length=3)  # [Length, Width, Height]
-    velocity_vector: List[float] = Field(..., min_length=3, max_length=3) # [Vx, Vy, Vz]
-    occlusion_state: str # e.g., "none", "partial_500ms", "total"
+    center_xyz: List[float] = Field(..., min_length=3, max_length=3)
+    extent_lwh: List[float] = Field(..., min_length=3, max_length=3)
+    velocity_vector: List[float] = Field(..., min_length=3, max_length=3)
+    occlusion_state: str
 
 class SpatialFramePayload(BaseModel):
     scene_id: str
     frame_timestamp: float
-    ego_velocity_vector: List[float] = Field(..., min_length=3, max_length=3) # [Vx, Vy, Vz]
-    camera_extrinsics_rt: List[List[float]] # 3x4 or 4x4 matrix transformation rows
+    ego_velocity_vector: List[float] = Field(..., min_length=3, max_length=3)
+    camera_extrinsics_rt: List[List[float]]
     detected_objects: List[BoundingBox3D]
 
 class DatasetBridgePayload(BaseModel):
@@ -142,17 +115,12 @@ class DatasetBridgePayload(BaseModel):
 class QueryPayload(BaseModel):
     prompt: str
 
-# --- Spatial Math Serialization Utility ---
-
 def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
-    """Converts multi-dimensional matrix inputs and coordinate tracking telemetry into a string representation."""
     ego_speed = (sum(v**2 for v in payload.ego_velocity_vector))**0.5
-
     structural_string = (
         f"Sequence frame token: {payload.scene_id}. Physical Timestamp offsets: {payload.frame_timestamp:.3f}s. "
         f"Ego vehicle linear velocity state magnitude: {ego_speed:.2f} m/s. "
     )
-
     for idx, box in enumerate(payload.detected_objects):
         distance_euclidean = (sum(c**2 for c in box.center_xyz))**0.5
         structural_string += (
@@ -163,28 +131,12 @@ def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
             f"Trajectory velocity component vectors Vx:{box.velocity_vector[0]:.2f} Vy:{box.velocity_vector[1]:.2f}. "
             f"Occlusion status flag: {box.occlusion_state}. "
         )
-
     return structural_string
 
-# --- Asynchronous Worker Logic ---
-
 def process_and_store_telemetry(payload: SpatialFramePayload):
-    """Background task function handling serialization, native embedding, and DB insertion."""
     try:
         serialized_context = serialize_spatial_frame(payload)
-
-        # Generate spatial feature embedding coordinates via native sentence-transformers
         spatial_vector = get_spatial_embedding(serialized_context)
-
-        # --- Old Ollama Ingestion Code Block ---
-        # response = ollama.embed(model=EMBED_MODEL, input=serialized_context)
-        # if 'embeddings' in response and response['embeddings']:
-        #     spatial_vector = response['embeddings'][0]
-        # elif 'embedding' in response:
-        #     spatial_vector = response['embedding']
-        # else:
-        #     print("[-] Critical Error: Ollama output missing valid vector matrix types.")
-        #     return
 
         conn = psycopg2.connect(**DB_PARAMS)
         cursor = conn.cursor()
@@ -204,7 +156,6 @@ def process_and_store_telemetry(payload: SpatialFramePayload):
                 spatial_vector
             )
         )
-
         conn.commit()
         cursor.close()
         conn.close()
@@ -212,14 +163,13 @@ def process_and_store_telemetry(payload: SpatialFramePayload):
     except Exception as e:
         print(f"[-] Background Ingestion Thread Exception: {str(e)}")
 
-# --- REST Endpoints ---
-
 @app.post("/ingest/spatial", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_spatial_telemetry(payload: SpatialFramePayload, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_and_store_telemetry, payload)
     return {
         "status": "QUEUED",
-        "scene_id": payload.scene_id,
+        "scene_indexed": payload.scene_id,
+        "frame_timestamp": payload.frame_timestamp,
         "detail": "Spatial extraction processing initiated on worker thread loop."
     }
 
@@ -261,19 +211,12 @@ async def ingest_through_dataset_bridge(payload: DatasetBridgePayload, backgroun
         raise HTTPException(status_code=500, detail=f"Dataset Transformation Exception: {str(e)}")
 
 def extract_state_vector(llm_text: str) -> Optional[List[float]]:
-    """
-    Parses strict LaTeX state-space arrays from local LLM context blocks.
-    Falls back to explicit text parameter scanning if the math block contains literal placeholders.
-    """
-    # Pass 1: Standard LaTeX check for active digit arrays: x = [1.2, 3.4, ...]^T
-    math_pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)(?:,\s*(-?\d+(?:\.\d+)?))?\s*\]\^T"
+    """Parses strict LaTeX state-space arrays from local LLM context blocks."""
+    math_pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\s*\]\^T"
     match = re.search(math_pattern, llm_text)
     if match:
-        extracted = [float(c) for c in match.groups() if c is not None]
-        if extracted:
-            return extracted
+        return [float(c) for c in match.groups()]
 
-    # Pass 2: Fallback Parameter Extraction (Scans the rigid bullet points populated by the LLM)
     try:
         x_match = re.search(r"Relative Position:\s*X:\s*\[?(-?\d+(?:\.\d+)?)\]?", llm_text)
         y_match = re.search(r"Relative Position:.*?Y:\s*\[?(-?\d+(?:\.\d+)?)\]?", llm_text)
@@ -288,34 +231,27 @@ def extract_state_vector(llm_text: str) -> Optional[List[float]]:
             return [x, y, vx, vy]
     except Exception as e:
         print(f"[-] Regex parameter fallback exception: {e}")
-
     return None
 
 @app.post("/query/scenario")
 async def query_scenario_pipeline(payload: QueryPayload):
     try:
-        # Generate dense prompt vector directly on local hardware via Sentence Transformers
         query_vector = get_spatial_embedding(payload.prompt)
-
-        # --- Old Ollama Query Code Block ---
-        # response = ollama.embed(model=EMBED_MODEL, input=payload.prompt)
-        # if 'embeddings' in response and response['embeddings']:
-        #     query_vector = response['embeddings'][0]
-        # else:
-        #     query_vector = response['embedding']
 
         conn = psycopg2.connect(**DB_PARAMS)
         cursor = conn.cursor()
         register_vector(conn)
 
+        # Vector similarity search limited to spatial distance tolerances
         cursor.execute(
             """
-            SELECT scene_id, frame_timestamp, raw_telemetry_json
+            SELECT scene_id, frame_timestamp, raw_telemetry_json, (spatial_geometry_embedding <=> %s::vector) as distance
             FROM spatial_scene_store
-            ORDER BY spatial_geometry_embedding <=> %s::vector
-            LIMIT 3;
+            WHERE (spatial_geometry_embedding <=> %s::vector) < 0.75
+            ORDER BY distance ASC
+            LIMIT 2;
             """,
-            (query_vector,)
+            (query_vector, query_vector)
         )
         records = cursor.fetchall()
         cursor.close()
@@ -323,9 +259,9 @@ async def query_scenario_pipeline(payload: QueryPayload):
 
         if not records:
             return {
-                "answer": "No indexed scene matrices discovered in spatial database layers.",
+                "answer": r"$$x = [METRIC\_EXTRACTION\_FAILED]$$" + "\n- Status: Fallback Triggered. No spatially relevant context matches found in the vector database layers.",
                 "state_vector_seed": None,
-                "status": "EMPTY_DATABASE"
+                "status": "METRIC_EXTRACTION_FAILED"
             }
 
         context_blocks = []
@@ -338,7 +274,7 @@ async def query_scenario_pipeline(payload: QueryPayload):
             for obj in raw_json.get("detected_objects", []):
                 objects_summary += (
                     f"- TARGET ID {obj['target_id']} Class: [{obj['classification'].upper()}]\n"
-                    f"  Position [X,Y,Z]: {obj['center_xyz']}\n"
+                    f"  Relative Position [X,Y,Z]: {obj['center_xyz']}\n"
                     f"  Size [L,W,H]: {obj['extent_lwh']}\n"
                     f"  Velocity [Vx,Vy,Vz]: {obj['velocity_vector']}\n"
                     f"  Visibility State: {obj['occlusion_state']}\n"
@@ -355,11 +291,12 @@ async def query_scenario_pipeline(payload: QueryPayload):
         system_instructions = (
             "You are a deterministic Autonomous Vehicle Data Extraction Component.\n"
             "CRITICAL COMMANDS:\n"
-            "1. Output ONLY exact parameters directly printed in the OBJECT LOGS context.\n"
-            "2. Keep numeric values completely intact. Never alter them.\n"
-            "3. Do NOT include conversational notes, greetings, explanations, or introductory text.\n"
-            "4. You MUST format the output exactly like the following markdown template block, filling in the bracketed properties.\n"
-            "5. The state vector array inside the brackets MUST contain EXACTLY four numeric values: [X, Y, Vx, Vy]. If Vy is missing, pad it with 0.0:\n\n"
+            "1. Read the provided OBJECT LOGS carefully.\n"
+            "2. Output exactly ONE template block tracking the single closest object matching the prompt.\n"
+            "3. Do NOT cross-contaminate properties between different target IDs.\n"
+            "4. Keep numeric values completely intact. Never alter, extrapolate, or hallucinate dimensions.\n"
+            "5. Do NOT include conversational notes or explanations. Start immediately with the template.\n"
+            "6. You MUST format the output exactly like the following markdown template block, filling in the properties:\n\n"
             "$$x = [X, Y, V_x, V_y]^T$$\n"
             "- Target ID: [target_id]\n"
             "- Classification: [classification]\n"
@@ -367,10 +304,8 @@ async def query_scenario_pipeline(payload: QueryPayload):
             "- Velocity Vectors: Vx: [Vx], Vy: [Vy]\n"
             "- Visibility State: [occlusion_state]\n\n"
             f"=== RETRIEVED TELEMETRY CONTEXT BANDS ===\n{context_payload}\n========================================="
-        )        
-        
-        # NOTE: Leaving this here as it requires an active, responding local llama-server instance.
-        # If your local Ollama daemon hangs or times out on ROCm, substitute this with a remote Groq endpoint.
+        )
+
         import ollama
         chat_res = ollama.chat(
             model="llama3.2",
@@ -391,6 +326,7 @@ async def query_scenario_pipeline(payload: QueryPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
