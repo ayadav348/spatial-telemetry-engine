@@ -26,6 +26,18 @@ with st.sidebar:
         st.warning("Backend API Daemon Offline")
 
     st.markdown("---")
+    if st.button("🗑️ Clear Database", type="primary", use_container_width=True):
+        try:
+            clear_res = requests.delete(f"{API_BASE}/db/clear")
+            if clear_res.status_code == 200:
+                st.success("Database cleared. All frames purged.")
+                st.rerun()
+            else:
+                st.error(f"Clear failed: {clear_res.text}")
+        except Exception as e:
+            st.error(f"Connection error: {e}")
+
+    st.markdown("---")
     st.subheader("🎭 Act 1 Ingestion Quick Loaders")
     
     # Pre-baked Demo Playloads
@@ -61,25 +73,20 @@ with st.sidebar:
 
     if st.button("Load nuScenes (Truck) Payload"):
         st.session_state["bridge_json_payload"] = json.dumps(nuscenes_macro, indent=2)
-        st.rerun()
 
     if st.button("Load Waymo (Motorcycle) Payload"):
         st.session_state["bridge_json_payload"] = json.dumps(waymo_macro, indent=2)
-        st.rerun()
 
     st.markdown("---")
     st.subheader("🔎 Act 2 Query Injection Presets")
     if st.button("Load Query A: Motorcycle Search"):
         st.session_state["active_search_prompt"] = "Find an oncoming or nearby motorcycle or bike with extreme obstruction or occlusion"
-        st.rerun()
-        
+
     if st.button("Load Query B: Truck Search"):
         st.session_state["active_search_prompt"] = "Retrieve a large commercial vehicle or heavy freight truck driving far away with completely clear line of sight"
-        st.rerun()
 
     if st.button("Load Query C: Edge Case Robustness Check"):
         st.session_state["active_search_prompt"] = "Show me a tailgating electric autonomous shuttle or delivery drone in heavy rain"
-        st.rerun()
 
 # --- Workspaces Processing Layout Matrix ---
 col1, col2 = st.columns(2)
@@ -152,39 +159,102 @@ with col1:
                 st.error(f"Handoff Connection Refused: {e}")
 
 with col2:
-    st.header("🔍 Conversational Query Workspace")
-    st.subheader("Scenario Matrix Constraint Extraction")
-    
-    if "active_search_prompt" not in st.session_state:
-        st.session_state["active_search_prompt"] = ""
+    st.header("🔍 Query Workspace")
+    sql_tab, scenario_tab = st.tabs(["🗄️ NL → SQL Query", "🤖 Scenario Vector Search"])
 
-    query_prompt = st.text_input(
-        "Search Query:",
-        value=st.session_state["active_search_prompt"],
-        placeholder="e.g., Find oncoming vehicles under occlusion closer than 15 meters"
-    )
-    
-    if st.button("⚡ Run Spatial Search Strategy", key="btn_search_execute"):
-        if query_prompt:
-            with st.spinner("Computing prompt cosine distance matrices..."):
-                try:
-                    response = requests.post(f"{API_BASE}/query/scenario", json={"prompt": query_prompt})
-                    if response.status_code == 200:
-                        res_data = response.json()
-                        answer = res_data.get("answer", "No response payload.")
-                        status_flag = res_data.get("status", "UNKNOWN")
-                        vector_seed = res_data.get("state_vector_seed", None)
-                        
-                        st.subheader("🤖 Synthesized Engineering Output:")
-                        st.markdown(answer)
-                        
-                        st.markdown("---")
-                        st.subheader("🔢 Downstream Tracking Metrics Registry")
-                        st.metric(label="Extraction Status Profile", value=status_flag)
-                        st.write("Parsed Target Matrix Seed ($x$):", vector_seed)
-                    else:
-                        st.error(f"Backend Query Processing Exception: {response.text}")
-                except Exception as e:
-                    st.error(f"Failed to communicate with API server: {e}")
-        else:
-            st.warning("Please specify a constraint scenario query sequence first.")
+    with scenario_tab:
+        st.subheader("Scenario Matrix Constraint Extraction")
+
+        if "active_search_prompt" not in st.session_state:
+            st.session_state["active_search_prompt"] = ""
+
+        query_prompt = st.text_input(
+            "Search Query:",
+            placeholder="e.g., Find oncoming vehicles under occlusion closer than 15 meters",
+            key="active_search_prompt"
+        )
+
+        if st.button("⚡ Run Spatial Search Strategy", key="btn_search_execute"):
+            if query_prompt:
+                with st.spinner("Computing prompt cosine distance matrices..."):
+                    try:
+                        response = requests.post(f"{API_BASE}/query/scenario", json={"prompt": query_prompt})
+                        if response.status_code == 200:
+                            res_data = response.json()
+                            answer = res_data.get("answer", "No response payload.")
+                            status_flag = res_data.get("status", "UNKNOWN")
+                            vector_seed = res_data.get("state_vector_seed", None)
+
+                            st.subheader("🤖 Synthesized Engineering Output:")
+                            st.markdown(answer)
+
+                            st.markdown("---")
+                            st.subheader("🔢 Downstream Tracking Metrics Registry")
+                            st.metric(label="Extraction Status Profile", value=status_flag)
+                            st.write("Parsed Target Matrix Seed ($x$):", vector_seed)
+                        else:
+                            st.error(f"Backend Query Processing Exception: {response.text}")
+                    except Exception as e:
+                        st.error(f"Failed to communicate with API server: {e}")
+            else:
+                st.warning("Please specify a constraint scenario query sequence first.")
+
+    with sql_tab:
+        st.subheader("Natural Language → SQL Generator")
+        st.caption("Describe what you want to retrieve in plain English. The engine will generate, validate, and execute a SQL query against the spatial telemetry store.")
+
+        if "sql_nl_input_field" not in st.session_state:
+            st.session_state["sql_nl_input_field"] = ""
+
+        sql_query_presets = {
+            "Show all frames": "Show me all ingested scene frames with their timestamps and scene IDs",
+            "Totally occluded objects": "Find all frames containing objects with total occlusion",
+            "Fast ego frames": "Show frames where the ego vehicle was traveling faster than 10 m/s",
+            "Count by scene": "Count how many frames exist per scene ID",
+        }
+
+        st.markdown("**Quick Presets:**")
+        preset_cols = st.columns(2)
+        for i, (label, preset_prompt) in enumerate(sql_query_presets.items()):
+            with preset_cols[i % 2]:
+                if st.button(label, key=f"sql_preset_{i}"):
+                    st.session_state["sql_nl_input_field"] = preset_prompt
+
+        sql_nl_input = st.text_input(
+            "Natural Language Query:",
+            placeholder="e.g., Show all frames with motorcycles that have total occlusion",
+            key="sql_nl_input_field"
+        )
+
+        if st.button("⚡ Generate & Execute SQL", key="btn_sql_execute"):
+            if sql_nl_input:
+                with st.spinner("Generating SQL via llama3.2 and executing against spatial store..."):
+                    try:
+                        response = requests.post(f"{API_BASE}/query/sql", json={"prompt": sql_nl_input})
+                        if response.status_code == 200:
+                            res_data = response.json()
+                            generated_sql = res_data.get("generated_sql", "")
+                            rows = res_data.get("rows", [])
+                            row_count = res_data.get("row_count", 0)
+                            status_flag = res_data.get("status", "UNKNOWN")
+                            detail = res_data.get("detail", "")
+
+                            st.markdown("**Generated SQL:**")
+                            st.code(generated_sql, language="sql")
+
+                            st.metric(label="Execution Status", value=status_flag)
+
+                            if status_flag == "SUCCESS":
+                                st.caption(f"{row_count} row(s) returned")
+                                if rows:
+                                    st.dataframe(rows, use_container_width=True)
+                                else:
+                                    st.info("Query executed successfully — no rows matched.")
+                            else:
+                                st.error(f"Detail: {detail}")
+                        else:
+                            st.error(f"Backend Error: {response.text}")
+                    except Exception as e:
+                        st.error(f"Connection error: {e}")
+            else:
+                st.warning("Enter a natural language query first.")

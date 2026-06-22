@@ -1,12 +1,16 @@
 # Spatial Telemetry Engine
 
-A fully local Retrieval-Augmented Generation (RAG) platform for ingesting, indexing, and querying structured 3D autonomous driving telemetry. The engine stores spatial scene frames as dense vector embeddings in PostgreSQL and enables natural-language semantic search over those scenes, optionally synthesizing structured state-vector outputs via a local LLM.
+A fully local RAG + NL-to-SQL platform for ingesting, indexing, and querying structured 3D autonomous driving telemetry. The engine stores spatial scene frames as dense vector embeddings in PostgreSQL and supports two complementary query modes: natural-language semantic search over scene embeddings, and schema-aware natural-language SQL generation executed directly against the telemetry store.
 
 ---
 
 ## What It Does
 
-The Spatial Telemetry Engine solves the problem of searching through large collections of 3D scene logs using natural language. Instead of writing SQL queries over raw coordinate data, you describe a scenario in plain English (e.g., *"find an oncoming sedan with partial occlusion under 20 meters"*) and the engine retrieves the most semantically similar frames from your indexed database.
+The Spatial Telemetry Engine solves two distinct problems over 3D AV scene logs:
+
+1. **Semantic scenario search** — Describe a traffic scenario in plain English (e.g., *"find an oncoming sedan with partial occlusion under 20 meters"*) and retrieve the most semantically similar indexed frames via cosine similarity over dense vector embeddings.
+
+2. **Natural language SQL** — Ask structured questions in plain English (e.g., *"show frames where the ego vehicle was traveling faster than 10 m/s"*) and have the engine automatically generate, validate, and execute a safe PostgreSQL query against the live telemetry store — no SQL knowledge required.
 
 **Core capabilities:**
 
@@ -14,17 +18,21 @@ The Spatial Telemetry Engine solves the problem of searching through large colle
 
 2. **Dataset Bridge** — Normalizes raw telemetry from heterogeneous autonomous driving datasets (nuScenes quaternion-based, Waymo yaw-based) into the engine's unified coordinate format. Handles ego-relative coordinate translation and quaternion-to-yaw conversion automatically.
 
-3. **Semantic Scenario Search** — Embeds a natural language query, performs cosine similarity search against all indexed frames, and returns the top 3 closest matching scenes. Optionally passes the retrieved context to a local `llama3.2` instance to synthesize a structured physics summary and extract a state-space seed vector $x = [X, Y, \dot{X}, \dot{Y}]^T$ for downstream tracking filters.
+3. **Semantic Scenario Search** — Embeds a natural language query, performs cosine similarity search against all indexed frames, and returns the closest matching scenes. Optionally passes the retrieved context to a local `llama3.2` instance to synthesize a structured physics summary and extract a state-space seed vector $x = [X, Y, \dot{X}, \dot{Y}]^T$ for downstream tracking filters.
 
-4. **Streamlit Dashboard** — A browser-based UI with two panes: an ingestion workspace (with tabs for native JSON payloads and dataset bridge mode) and a conversational query workspace.
+4. **NL-to-SQL Query Engine** — Introspects the live PostgreSQL schema at query time, injects it as structured context into a `llama3.2` prompt with AV-domain annotations, extracts and validates the generated SQL (SELECT-only, injection-safe), executes it on a read-only connection, and returns raw results as a structured JSON response.
+
+5. **Streamlit Dashboard** — A browser-based UI with an ingestion workspace (native JSON and dataset bridge tabs) and a query workspace (semantic search tab and NL-to-SQL tab with preset queries and live results table).
+
+6. **Manual Database Control** — Data persists across server restarts. A dedicated `DELETE /db/clear` endpoint (with a UI button) allows on-demand wipe of all frames for re-ingestion demos.
 
 ---
 
 ## Use Cases
 
 - **Autonomous vehicle research** — Index Waymo or nuScenes log segments and retrieve frames matching specific traffic scenarios for analysis or filter initialization.
-- **Tracking filter bootstrapping** — Use the query pipeline to automatically seed Kalman filter or other state estimators with real-world position and velocity vectors.
-- **Dataset exploration** — Search through thousands of indexed frames without writing SQL, using scenario descriptions as queries.
+- **Tracking filter bootstrapping** — Use the semantic query pipeline to automatically seed Kalman filter or other state estimators with real-world position and velocity vectors.
+- **Dataset exploration** — Search through indexed frames without writing SQL, using either scenario descriptions (vector search) or structured questions (NL-to-SQL).
 - **Custom sensor data** — Ingest any 3D bounding-box telemetry source (e.g., GoPro + IPM pipeline on a custom vehicle) via the native stream endpoint.
 - **Benchmarking & stress testing** — The included `benchmark_pipeline.py` generates synthetic Waymo-like sequences and measures ingestion latency and query accuracy.
 
@@ -33,33 +41,41 @@ The Spatial Telemetry Engine solves the problem of searching through large colle
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  User Interface Layer                   │
-│              Streamlit  (ui.py :8501)                   │
-└────────────────────────┬────────────────────────────────┘
-                         │  HTTP POST
-┌────────────────────────▼────────────────────────────────┐
-│                  REST API Backend                       │
-│              FastAPI + Uvicorn  (main.py :8000)         │
-│                                                         │
-│  POST /ingest/spatial        → native frame ingest      │
-│  POST /ingest/dataset-bridge → dataset normalization    │
-│  POST /query/scenario        → semantic search + LLM    │
-└──────────┬─────────────────────────────┬────────────────┘
-           │ psycopg2                    │ ollama (optional)
-┌──────────▼──────────┐      ┌──────────▼──────────────┐
-│  PostgreSQL          │      │  Ollama Daemon           │
-│  + pgvector          │      │  llama3.2 (query synth.) │
-│  spatial_vector_db   │      └─────────────────────────┘
-└─────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    User Interface Layer                     │
+│                Streamlit  (ui.py :8501)                     │
+│                                                             │
+│  Ingestion Workspace        Query Workspace                 │
+│  ├─ Native Stream Payload   ├─ NL → SQL Query (new)        │
+│  └─ Dataset Bridge          └─ Scenario Vector Search       │
+└────────────────────────┬────────────────────────────────────┘
+                         │  HTTP
+┌────────────────────────▼────────────────────────────────────┐
+│                    REST API Backend                         │
+│                FastAPI + Uvicorn  (main.py :8000)           │
+│                                                             │
+│  POST   /ingest/spatial        → native frame ingest        │
+│  POST   /ingest/dataset-bridge → dataset normalization      │
+│  POST   /query/scenario        → semantic search + LLM      │
+│  POST   /query/sql             → NL-to-SQL generation       │
+│  GET    /db/stats              → frame count                │
+│  DELETE /db/clear              → manual database wipe       │
+└──────────┬──────────────────────────────┬───────────────────┘
+           │ psycopg2                     │ ollama
+┌──────────▼──────────┐       ┌──────────▼──────────────────┐
+│  PostgreSQL          │       │  Ollama Daemon               │
+│  + pgvector          │       │  llama3.2                    │
+│  spatial_vector_db   │       │  ├─ scenario synthesis       │
+└─────────────────────┘       │  └─ SQL generation           │
+                               └─────────────────────────────┘
 
 Embedding: sentence-transformers all-MiniLM-L6-v2 (local, no daemon required)
 ```
 
 | Component | File | Role |
 |-----------|------|------|
-| FastAPI backend | `main.py` | REST endpoints, background ingestion, vector search, LLM query |
-| Streamlit UI | `ui.py` | Ingestion workspace, dataset bridge UI, conversational search |
+| FastAPI backend | `main.py` | REST endpoints, ingestion, vector search, NL-to-SQL, DB management |
+| Streamlit UI | `ui.py` | Ingestion workspace, dataset bridge, semantic search, SQL query tab |
 | Dataset bridge library | `dataset_bridge.py` | nuScenes/Waymo coordinate normalization utilities |
 | Benchmark suite | `benchmark_pipeline.py` | Synthetic load generation and latency profiling |
 | Simulation test | `test_ingest.py` | 10-frame highway simulation ingest test |
@@ -80,13 +96,15 @@ The engine stores one row per scene frame in PostgreSQL:
 | `raw_telemetry_json` | jsonb | Full original payload including all detected objects |
 | `spatial_geometry_embedding` | vector(384) | Dense embedding of the serialized scene description |
 
+Data **persists across server restarts**. Use `DELETE /db/clear` or the UI button to wipe frames manually.
+
 ---
 
 ## Requirements
 
 - Python 3.10+
 - PostgreSQL running locally on port `5432` with the `pgvector` extension
-- Ollama (only required for the `/query/scenario` LLM synthesis step — ingestion works without it)
+- Ollama with `llama3.2` pulled (required for `/query/scenario` LLM synthesis and `/query/sql` generation — ingestion works without it)
 
 ---
 
@@ -111,7 +129,7 @@ pip install -r requirements.txt
 pip install sentence-transformers
 ```
 
-### 3. Ollama (optional — for LLM query synthesis)
+### 3. Ollama (required for both query endpoints)
 
 ```bash
 ollama pull llama3.2
@@ -223,7 +241,7 @@ The bridge computes ego-relative coordinates (`box_translation - ego_translation
 
 ### `POST /query/scenario`
 
-Perform semantic search over indexed frames. Embeds the prompt, finds the 3 nearest frames by cosine distance, and (if Ollama is running) passes them to `llama3.2` to generate a structured output.
+Semantic search over indexed frames. Embeds the prompt, finds nearest frames by cosine distance, and passes retrieved context to `llama3.2` to synthesize a structured output.
 
 **Request:**
 ```json
@@ -240,6 +258,102 @@ Perform semantic search over indexed frames. Embeds the prompt, finds the 3 near
 ```
 
 `state_vector_seed` is `[X, Y, Vx, Vy]` extracted from the LLM output, ready to initialize a tracking filter. Returns `null` if extraction fails or Ollama is not available.
+
+---
+
+### `POST /query/sql`
+
+Schema-aware natural language to SQL. Introspects the live database schema, injects it with AV-domain context into a `llama3.2` prompt, validates the generated query (SELECT-only, blocklist enforcement, table allowlist), and executes it on a read-only connection.
+
+**Request:**
+```json
+{ "prompt": "Show frames where the ego vehicle was traveling faster than 10 m/s" }
+```
+
+**Response:**
+```json
+{
+  "generated_sql": "SELECT id, scene_id, frame_timestamp, ego_velocity_vector\nFROM spatial_scene_store\nWHERE sqrt(ego_velocity_vector[1]^2 + ego_velocity_vector[2]^2 + ego_velocity_vector[3]^2) > 10.0\nORDER BY frame_timestamp\nLIMIT 50;",
+  "rows": [
+    {
+      "id": 2,
+      "scene_id": "waymo-sf-mission-seq-1092",
+      "frame_timestamp": 182.904,
+      "ego_velocity_vector": [14.15, 0.22, -0.02]
+    }
+  ],
+  "row_count": 1,
+  "status": "SUCCESS"
+}
+```
+
+Status values: `SUCCESS`, `VALIDATION_FAILED` (with `detail` explaining rejection reason), `EXECUTION_ERROR` (with `detail` containing the PostgreSQL error).
+
+Security model:
+- Only `SELECT` statements are permitted
+- Blocklist rejects: `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, `CREATE`, `EXECUTE`, `GRANT`, `REVOKE`, `--`, `/*`
+- Only `spatial_scene_store` may be referenced — cross-table queries are rejected
+- Execution runs on a `readonly=True` psycopg2 connection as a PostgreSQL-level safeguard
+- The `spatial_geometry_embedding` vector column is excluded from results automatically
+
+---
+
+### `GET /db/stats`
+
+Returns the current frame count.
+
+**Response:** `{ "frame_count": 2 }`
+
+---
+
+### `DELETE /db/clear`
+
+Wipes all telemetry frames and resets the identity sequence. Equivalent to `TRUNCATE TABLE spatial_scene_store RESTART IDENTITY`.
+
+**Response:** `{ "status": "CLEARED", "message": "All telemetry frames purged. Identity sequence reset." }`
+
+---
+
+## NL-to-SQL Pipeline Flow
+
+```
+User natural language prompt
+          │
+          ▼
+extract_schema_context()
+  → queries information_schema.columns
+  → annotates each column with AV domain meaning
+  → documents JSONB structure of raw_telemetry_json
+          │
+          ▼
+llama3.2 (via Ollama)
+  → system prompt: schema context + AV domain rules + output format rules
+  → user message: natural language prompt
+          │
+          ▼
+extract_sql_block()
+  → strips ```sql ... ``` fences from LLM output
+          │
+          ▼
+validate_generated_sql()
+  → must start with SELECT
+  → blocklist check (DROP, DELETE, INSERT, etc.)
+  → table allowlist (spatial_scene_store only)
+          │
+          ├─ VALIDATION_FAILED → return early with rejection reason
+          │
+          ▼
+psycopg2 (readonly=True connection)
+  → cursor.execute(generated_sql)
+          │
+          ▼
+Result serialization
+  → embedding column replaced with "[vector omitted]"
+  → numpy types converted to Python native
+          │
+          ▼
+{ generated_sql, rows, row_count, status }
+```
 
 ---
 
@@ -293,7 +407,8 @@ The benchmark generates a synthetic 150-frame Waymo SF Mission sequence at 10 Hz
 
 ## Notes
 
-- The `/query/scenario` endpoint requires a running Ollama instance with `llama3.2` pulled. Ingestion (`/ingest/spatial`, `/ingest/dataset-bridge`) works entirely without Ollama.
+- Both `/query/scenario` and `/query/sql` require a running Ollama instance with `llama3.2` pulled. Ingestion works entirely without Ollama.
 - The embedding model (`all-MiniLM-L6-v2`, 384 dimensions) is downloaded automatically by `sentence-transformers` on first run.
 - DB credentials are hardcoded in `main.py` (`DB_PARAMS`). Update to match your local PostgreSQL configuration.
 - The `dataset_bridge.py` module contains a standalone `DatasetTelemetryBridge` class with `extract_nuscenes_kinematics` and `extract_waymo_kinematics` methods that can be used independently of the API.
+- Data persists across server restarts. Use the sidebar "Clear Database" button in the UI or `DELETE /db/clear` directly to wipe frames between demo runs.

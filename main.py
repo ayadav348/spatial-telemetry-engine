@@ -53,18 +53,9 @@ def init_db():
     conn.close()
 
 @app.on_event("startup")
-def startup_event():    
+def startup_event():
     init_db()
-    print("[Database Initializer] Establishing connection matrix for initialization...")
-    try:
-        conn = psycopg2.connect(**DB_PARAMS)
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE spatial_scene_store RESTART IDENTITY;")
-            conn.commit()
-            print("[Database Initializer] Stale telemetry frames purged. DB is clean!")
-        conn.close()
-    except Exception as e:
-        print(f"[-] Startup Database Reset Failed: {e}")
+    print("[Database Initializer] Spatial telemetry store initialized. Existing frames preserved.")
 
 # --- Metrics Verification Endpoint ---
 @app.get("/db/stats")
@@ -80,6 +71,20 @@ def get_db_stats():
         return {"frame_count": count}
     except Exception as e:
         return {"frame_count": -1, "error": str(e)}
+
+# --- Manual Database Clear Endpoint ---
+@app.delete("/db/clear")
+def clear_database():
+    """Wipes all telemetry frames from the store. Resets identity sequence."""
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE spatial_scene_store RESTART IDENTITY;")
+            conn.commit()
+        conn.close()
+        return {"status": "CLEARED", "message": "All telemetry frames purged. Identity sequence reset."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database Clear Failed: {str(e)}")
 
 # --- Pydantic Validation Models ---
 
@@ -113,6 +118,9 @@ class DatasetBridgePayload(BaseModel):
     occlusion_state: str
 
 class QueryPayload(BaseModel):
+    prompt: str
+
+class SQLQueryPayload(BaseModel):
     prompt: str
 
 def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
@@ -232,6 +240,201 @@ def extract_state_vector(llm_text: str) -> Optional[List[float]]:
     except Exception as e:
         print(f"[-] Regex parameter fallback exception: {e}")
     return None
+
+def extract_schema_context() -> str:
+    """Introspects live PostgreSQL schema for spatial_scene_store and returns a formatted context string."""
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT column_name, data_type, udt_name
+            FROM information_schema.columns
+            WHERE table_name = 'spatial_scene_store'
+            ORDER BY ordinal_position;
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        annotations = {
+            "id":                          "auto-increment primary key — do not filter on this",
+            "scene_id":                    "text label for the scene or log segment (e.g. 'waymo-sf-mission-seq-1092')",
+            "frame_timestamp":             "time offset in seconds (real/float)",
+            "ego_velocity_vector":         "ego vehicle velocity array [Vx, Vy, Vz] in m/s — use 1-based index operators ONLY: ego_velocity_vector[1], ego_velocity_vector[2], ego_velocity_vector[3]. NEVER use ANY() in WHERE clauses.",
+            "raw_telemetry_json":          "full JSONB scene payload — use -> and ->> operators to extract detected_objects, classification, occlusion_state, center_xyz, velocity_vector",
+            "spatial_geometry_embedding":  "384-dim pgvector embedding — NEVER include in SELECT or WHERE clauses",
+        }
+
+        lines = ["Table: spatial_scene_store", "Columns:"]
+        for col_name, data_type, udt_name in rows:
+            display_type = udt_name if data_type == "USER-DEFINED" else data_type
+            note = annotations.get(col_name, "")
+            lines.append(f"  - {col_name} ({display_type}){': ' + note if note else ''}")
+
+        lines += [
+            "",
+            "JSONB structure of raw_telemetry_json:",
+            "  {",
+            '    "scene_id": str,',
+            '    "frame_timestamp": float,',
+            '    "ego_velocity_vector": [Vx, Vy, Vz],',
+            '    "camera_extrinsics_rt": [[...], [...], [...]],',
+            '    "detected_objects": [',
+            '      {',
+            '        "target_id": int,',
+            '        "classification": str,   -- e.g. "car", "truck", "motorcycle"',
+            '        "center_xyz": [X, Y, Z], -- position relative to ego vehicle in meters',
+            '        "extent_lwh": [L, W, H],',
+            '        "velocity_vector": [Vx, Vy, Vz],',
+            '        "occlusion_state": str   -- one of: "none", "partial_500ms", "total"',
+            '      }',
+            '    ]',
+            '  }',
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Schema introspection failed: {str(e)}"
+
+
+def validate_generated_sql(sql: str) -> tuple:
+    """Validates LLM-generated SQL. Returns (is_valid: bool, reason: str)."""
+    stripped = sql.strip().upper()
+
+    if not stripped.startswith("SELECT"):
+        return False, "Only SELECT queries are permitted."
+
+    blocklist = [
+        "DROP", "DELETE", "UPDATE", "INSERT", "TRUNCATE",
+        "ALTER", "CREATE", "EXECUTE", "GRANT", "REVOKE",
+        "--", "/*", "XP_", "EXEC("
+    ]
+    for term in blocklist:
+        if term in stripped:
+            return False, f"Forbidden keyword detected: '{term}'"
+
+    allowed_tables = ["SPATIAL_SCENE_STORE"]
+    import re as _re
+    from_tables = _re.findall(r'FROM\s+(\w+)', stripped)
+    join_tables = _re.findall(r'JOIN\s+(\w+)', stripped)
+    referenced = set(from_tables + join_tables)
+    for table in referenced:
+        if table not in allowed_tables:
+            return False, f"Unauthorized table reference: '{table.lower()}'"
+
+    return True, ""
+
+
+def extract_sql_block(llm_text: str) -> str:
+    """Extracts a SQL query from an LLM response, stripping markdown fences if present."""
+    # Try to extract from ```sql ... ``` block
+    fence_match = re.search(r"```(?:sql)?\s*([\s\S]+?)```", llm_text, re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+    # Fallback: find first SELECT statement
+    select_match = re.search(r"(SELECT[\s\S]+?;)", llm_text, re.IGNORECASE)
+    if select_match:
+        return select_match.group(1).strip()
+    # Last resort: return stripped text
+    return llm_text.strip()
+
+
+@app.post("/query/sql")
+async def natural_language_sql_query(payload: SQLQueryPayload):
+    """NL → SQL pipeline: schema-aware context injection → llama3.2 → validation → readonly execution."""
+    try:
+        schema_context = extract_schema_context()
+
+        system_prompt = (
+            "You are a PostgreSQL query generator for an autonomous vehicle spatial telemetry database.\n"
+            "You have access to exactly one table. Generate only SELECT queries.\n\n"
+            f"{schema_context}\n\n"
+            "AV domain rules — read carefully before generating any query:\n\n"
+            "1. ego_velocity_vector is a PostgreSQL real[] column (NOT jsonb). It stores [Vx, Vy, Vz] in m/s.\n"
+            "   - To filter by ego speed, compute the magnitude using array indexing (1-based in PostgreSQL):\n"
+            "     WHERE sqrt(ego_velocity_vector[1]^2 + ego_velocity_vector[2]^2 + ego_velocity_vector[3]^2) > 10.0\n"
+            "   - NEVER use raw_telemetry_json to access ego speed. NEVER use ->> or -> on ego_velocity_vector.\n\n"
+            "2. detected_objects are inside raw_telemetry_json (jsonb). Use these patterns:\n"
+            "   - Filter by classification:  raw_telemetry_json -> 'detected_objects' @> '[{\"classification\": \"car\"}]'\n"
+            "   - Filter by occlusion:       raw_telemetry_json -> 'detected_objects' @> '[{\"occlusion_state\": \"total\"}]'\n"
+            "   - Count objects per frame:   jsonb_array_length(raw_telemetry_json -> 'detected_objects')\n"
+            "   - NEVER use raw_telemetry_json ->> 'classification' — classification is nested inside detected_objects, not a top-level key.\n\n"
+            "3. spatial_geometry_embedding is a pgvector column — NEVER include it in SELECT or WHERE.\n\n"
+            "Output rules:\n"
+            "- Return ONLY a SQL code block inside ```sql ... ``` fences. No explanation, no commentary.\n"
+            "- Always end the query with a semicolon.\n"
+            "- Use only standard PostgreSQL 14+ syntax.\n"
+            "- Limit results to 50 rows maximum unless the user asks for aggregates."
+        )
+
+        import ollama
+        chat_res = ollama.chat(
+            model="llama3.2",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": payload.prompt}
+            ]
+        )
+
+        raw_llm_output = chat_res['message']['content']
+        generated_sql = extract_sql_block(raw_llm_output)
+
+        is_valid, rejection_reason = validate_generated_sql(generated_sql)
+        if not is_valid:
+            return {
+                "generated_sql": generated_sql,
+                "rows": [],
+                "row_count": 0,
+                "status": "VALIDATION_FAILED",
+                "detail": rejection_reason
+            }
+
+        # Execute on a read-only connection — PostgreSQL-level safeguard
+        conn = psycopg2.connect(**DB_PARAMS)
+        conn.set_session(readonly=True)
+        cursor = conn.cursor()
+        register_vector(conn)
+
+        try:
+            cursor.execute(generated_sql)
+            raw_rows = cursor.fetchall()
+            col_names = [desc[0] for desc in cursor.description]
+        except Exception as exec_err:
+            cursor.close()
+            conn.close()
+            return {
+                "generated_sql": generated_sql,
+                "rows": [],
+                "row_count": 0,
+                "status": "EXECUTION_ERROR",
+                "detail": str(exec_err)
+            }
+
+        cursor.close()
+        conn.close()
+
+        # Serialize rows — convert any non-JSON-serializable types to strings
+        serialized_rows = []
+        for row in raw_rows:
+            serialized_row = {}
+            for col, val in zip(col_names, row):
+                if col == "spatial_geometry_embedding":
+                    serialized_row[col] = "[vector omitted]"
+                elif hasattr(val, 'tolist'):
+                    serialized_row[col] = val.tolist()
+                else:
+                    serialized_row[col] = val
+            serialized_rows.append(serialized_row)
+
+        return {
+            "generated_sql": generated_sql,
+            "rows": serialized_rows,
+            "row_count": len(serialized_rows),
+            "status": "SUCCESS"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/query/scenario")
 async def query_scenario_pipeline(payload: QueryPayload):
