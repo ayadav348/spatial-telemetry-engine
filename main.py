@@ -296,27 +296,58 @@ def extract_schema_context() -> str:
         return f"Schema introspection failed: {str(e)}"
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Removes SQL line comments (--) and block comments (/* */) from a query string."""
+    # Remove block comments first
+    sql = re.sub(r'/\*[\s\S]*?\*/', ' ', sql)
+    # Remove line comments
+    sql = re.sub(r'--[^\n]*', ' ', sql)
+    return sql.strip()
+
+
 def validate_generated_sql(sql: str) -> tuple:
     """Validates LLM-generated SQL. Returns (is_valid: bool, reason: str)."""
-    stripped = sql.strip().upper()
+    # Strip comments before any analysis so they don't trigger false positives
+    clean_sql = _strip_sql_comments(sql)
+    stripped = clean_sql.strip().upper()
 
-    if not stripped.startswith("SELECT"):
+    if not stripped.startswith("SELECT") and not re.match(r'^\s*WITH\b', stripped):
         return False, "Only SELECT queries are permitted."
 
-    blocklist = [
+    # Use word-boundary matching to avoid false positives on column/alias names
+    # that contain blocklist words as substrings (e.g. "update_count", "created_at")
+    dml_keywords = [
         "DROP", "DELETE", "UPDATE", "INSERT", "TRUNCATE",
-        "ALTER", "CREATE", "EXECUTE", "GRANT", "REVOKE",
-        "--", "/*", "XP_", "EXEC("
+        "ALTER", "CREATE", "GRANT", "REVOKE",
     ]
-    for term in blocklist:
-        if term in stripped:
+    for term in dml_keywords:
+        if re.search(rf'\b{term}\b', stripped):
             return False, f"Forbidden keyword detected: '{term}'"
 
-    allowed_tables = ["SPATIAL_SCENE_STORE"]
-    import re as _re
-    from_tables = _re.findall(r'FROM\s+(\w+)', stripped)
-    join_tables = _re.findall(r'JOIN\s+(\w+)', stripped)
+    # Block dangerous function calls that work inside a SELECT
+    dangerous_funcs = ["PG_READ_FILE", "PG_LS_DIR", "LO_EXPORT", "PG_SLEEP", "EXEC(", "EXECUTE(", "XP_"]
+    for term in dangerous_funcs:
+        if term in stripped:
+            return False, f"Forbidden function/keyword detected: '{term}'"
+
+    # Block multi-statement injection (bare semicolon followed by another statement)
+    if re.search(r';\s*\S', stripped):
+        return False, "Multi-statement queries are not permitted."
+
+    allowed_tables = {"SPATIAL_SCENE_STORE"}
+
+    # Extract table names from FROM and JOIN clauses; handle optional schema prefix
+    from_tables = re.findall(r'FROM\s+(?:\w+\.)?(\w+)', stripped)
+    join_tables = re.findall(r'JOIN\s+(?:\w+\.)?(\w+)', stripped)
     referenced = set(from_tables + join_tables)
+
+    # Remove CTE names from the referenced set — they are not real tables.
+    # A CTE is defined as: WITH <name> AS (
+    cte_names = set(re.findall(r'\bWITH\s+(\w+)\s+AS\s*\(', stripped))
+    # Also handle comma-separated CTEs: , <name> AS (
+    cte_names |= set(re.findall(r',\s*(\w+)\s+AS\s*\(', stripped))
+    referenced -= cte_names
+
     for table in referenced:
         if table not in allowed_tables:
             return False, f"Unauthorized table reference: '{table.lower()}'"
@@ -375,7 +406,10 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
             ]
         )
 
-        raw_llm_output = chat_res['message']['content']
+        raw_llm_output = chat_res.message.content
+        if not raw_llm_output:
+            raise HTTPException(status_code=502, detail="LLM returned an empty response. Try rephrasing the query.")
+
         generated_sql = extract_sql_block(raw_llm_output)
 
         is_valid, rejection_reason = validate_generated_sql(generated_sql)
@@ -390,37 +424,47 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
 
         # Execute on a read-only connection — PostgreSQL-level safeguard
         conn = psycopg2.connect(**DB_PARAMS)
-        conn.set_session(readonly=True)
-        cursor = conn.cursor()
-        register_vector(conn)
-
         try:
-            cursor.execute(generated_sql)
-            raw_rows = cursor.fetchall()
-            col_names = [desc[0] for desc in cursor.description]
-        except Exception as exec_err:
-            cursor.close()
-            conn.close()
-            return {
-                "generated_sql": generated_sql,
-                "rows": [],
-                "row_count": 0,
-                "status": "EXECUTION_ERROR",
-                "detail": str(exec_err)
-            }
+            conn.set_session(readonly=True)
+            cursor = conn.cursor()
+            register_vector(conn)
 
-        cursor.close()
-        conn.close()
+            try:
+                cursor.execute(generated_sql)
+                raw_rows = cursor.fetchall()
+                col_names = [desc[0] for desc in cursor.description]
+            except Exception as exec_err:
+                cursor.close()
+                return {
+                    "generated_sql": generated_sql,
+                    "rows": [],
+                    "row_count": 0,
+                    "status": "EXECUTION_ERROR",
+                    "detail": str(exec_err)
+                }
+
+            cursor.close()
+        finally:
+            conn.close()
+
+        # Embedding column names to suppress (catches aliases via pgvector type check)
+        VECTOR_COLS = {"spatial_geometry_embedding"}
 
         # Serialize rows — convert any non-JSON-serializable types to strings
         serialized_rows = []
         for row in raw_rows:
             serialized_row = {}
             for col, val in zip(col_names, row):
-                if col == "spatial_geometry_embedding":
+                if col in VECTOR_COLS:
+                    serialized_row[col] = "[vector omitted]"
+                elif hasattr(val, '__class__') and type(val).__name__ == 'Vector':
+                    # Catch pgvector objects that slipped through via an alias
                     serialized_row[col] = "[vector omitted]"
                 elif hasattr(val, 'tolist'):
                     serialized_row[col] = val.tolist()
+                elif hasattr(val, 'isoformat'):
+                    # datetime, date, time objects
+                    serialized_row[col] = val.isoformat()
                 else:
                     serialized_row[col] = val
             serialized_rows.append(serialized_row)
