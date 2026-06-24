@@ -5,13 +5,17 @@ import socket
 import json
 import math
 import re
+import functools
+import threading
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import psycopg2
+from psycopg2 import pool as psycopg2_pool
 from pgvector.psycopg2 import register_vector
 from sentence_transformers import SentenceTransformer
+import ollama
 
 app = FastAPI(title="Spatial Telemetry Engine", description="Local 3D Scene Discovery & Volumetric Retrieval Platform")
 
@@ -23,6 +27,51 @@ DB_PARAMS = {
     "port": "5432"
 }
 
+# --- Connection Pool Layer ---
+# Replaces per-request psycopg2.connect() (new TCP handshake + session setup every call)
+# with a reusable pool of warm connections. This is the dominant latency win for the
+# NL->SQL pipeline under repeated queries.
+CONNECTION_POOL: Optional[psycopg2_pool.ThreadedConnectionPool] = None
+_POOL_LOCK = threading.Lock()
+# Track which physical connections have had the pgvector type adapter registered,
+# so we only register once per connection rather than on every checkout.
+_VECTOR_REGISTERED_CONNS = set()
+
+
+def init_pool():
+    """Lazily build the global threaded connection pool. Safe to call repeatedly."""
+    global CONNECTION_POOL
+    if CONNECTION_POOL is None:
+        with _POOL_LOCK:
+            if CONNECTION_POOL is None:
+                CONNECTION_POOL = psycopg2_pool.ThreadedConnectionPool(
+                    minconn=2, maxconn=10, **DB_PARAMS
+                )
+
+
+def get_conn(register_vec: bool = False):
+    """Check out a connection from the pool. Optionally register the pgvector adapter."""
+    if CONNECTION_POOL is None:
+        init_pool()
+    conn = CONNECTION_POOL.getconn()
+    if register_vec and id(conn) not in _VECTOR_REGISTERED_CONNS:
+        register_vector(conn)
+        _VECTOR_REGISTERED_CONNS.add(id(conn))
+    return conn
+
+
+def put_conn(conn):
+    """Return a connection to the pool. Reset session state so readonly does not leak."""
+    if conn is None or CONNECTION_POOL is None:
+        return
+    try:
+        # Roll back any open transaction and clear readonly flag before reuse.
+        conn.rollback()
+        conn.set_session(readonly=False)
+    except Exception:
+        pass
+    CONNECTION_POOL.putconn(conn)
+
 # High-Velocity Native Local Embedding Layer
 SPATIAL_EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -33,27 +82,59 @@ def get_spatial_embedding(text_payload: str):
 
 def init_db():
     """Initializes extension registers and spatial telemetry store tables."""
-    conn = psycopg2.connect(**DB_PARAMS)
-    cursor = conn.cursor()
-    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        conn.commit()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS spatial_scene_store (
-            id serial PRIMARY KEY,
-            scene_id text NOT NULL,
-            frame_timestamp real NOT NULL,
-            ego_velocity_vector real[] NOT NULL,
-            raw_telemetry_json jsonb NOT NULL,
-            spatial_geometry_embedding vector(384)
-        );
-    """)
-    conn.commit()
-    cursor.close()
-    conn.close()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spatial_scene_store (
+                id serial PRIMARY KEY,
+                scene_id text NOT NULL,
+                frame_timestamp real NOT NULL,
+                ego_velocity_vector real[] NOT NULL,
+                raw_telemetry_json jsonb NOT NULL,
+                spatial_geometry_embedding vector(384)
+            );
+        """)
+        conn.commit()
+
+        # --- Vector Index ---
+        # Without an ANN index, every <=> cosine-distance query performs a full
+        # sequential scan. HNSW reduces vector search from O(n) to ~O(log n).
+        # Requires pgvector >= 0.5.0; degrade gracefully on older builds.
+        try:
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_spatial_embedding_hnsw
+                ON spatial_scene_store
+                USING hnsw (spatial_geometry_embedding vector_cosine_ops);
+            """)
+            conn.commit()
+            print("[Database Initializer] HNSW vector index ready.")
+        except Exception as idx_err:
+            conn.rollback()
+            print(f"[Database Initializer] HNSW index unavailable ({idx_err}); attempting IVFFlat fallback.")
+            try:
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_spatial_embedding_ivf
+                    ON spatial_scene_store
+                    USING ivfflat (spatial_geometry_embedding vector_cosine_ops)
+                    WITH (lists = 100);
+                """)
+                conn.commit()
+                print("[Database Initializer] IVFFlat vector index ready.")
+            except Exception as ivf_err:
+                conn.rollback()
+                print(f"[Database Initializer] No vector index created ({ivf_err}); sequential scan in use.")
+
+        cursor.close()
+    finally:
+        put_conn(conn)
 
 @app.on_event("startup")
 def startup_event():
+    init_pool()
     init_db()
     print("[Database Initializer] Spatial telemetry store initialized. Existing frames preserved.")
 
@@ -61,30 +142,34 @@ def startup_event():
 @app.get("/db/stats")
 def get_db_stats():
     """Returns database telemetry frame counts to verify initialization wiping."""
+    conn = None
     try:
-        conn = psycopg2.connect(**DB_PARAMS)
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM spatial_scene_store;")
         count = cursor.fetchone()[0]
         cursor.close()
-        conn.close()
         return {"frame_count": count}
     except Exception as e:
         return {"frame_count": -1, "error": str(e)}
+    finally:
+        put_conn(conn)
 
 # --- Manual Database Clear Endpoint ---
 @app.delete("/db/clear")
 def clear_database():
     """Wipes all telemetry frames from the store. Resets identity sequence."""
+    conn = None
     try:
-        conn = psycopg2.connect(**DB_PARAMS)
+        conn = get_conn()
         with conn.cursor() as cur:
             cur.execute("TRUNCATE TABLE spatial_scene_store RESTART IDENTITY;")
             conn.commit()
-        conn.close()
         return {"status": "CLEARED", "message": "All telemetry frames purged. Identity sequence reset."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database Clear Failed: {str(e)}")
+    finally:
+        put_conn(conn)
 
 # --- Pydantic Validation Models ---
 
@@ -142,13 +227,13 @@ def serialize_spatial_frame(payload: SpatialFramePayload) -> str:
     return structural_string
 
 def process_and_store_telemetry(payload: SpatialFramePayload):
+    conn = None
     try:
         serialized_context = serialize_spatial_frame(payload)
         spatial_vector = get_spatial_embedding(serialized_context)
 
-        conn = psycopg2.connect(**DB_PARAMS)
+        conn = get_conn(register_vec=True)
         cursor = conn.cursor()
-        register_vector(conn)
 
         cursor.execute(
             """
@@ -160,16 +245,17 @@ def process_and_store_telemetry(payload: SpatialFramePayload):
                 payload.scene_id,
                 payload.frame_timestamp,
                 payload.ego_velocity_vector,
-                json.dumps(payload.dict()),
+                json.dumps(payload.model_dump()),
                 spatial_vector
             )
         )
         conn.commit()
         cursor.close()
-        conn.close()
         print(f"[+] Asynchronously indexed tracking metrics for sequence frame: {payload.scene_id}")
     except Exception as e:
         print(f"[-] Background Ingestion Thread Exception: {str(e)}")
+    finally:
+        put_conn(conn)
 
 @app.post("/ingest/spatial", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_spatial_telemetry(payload: SpatialFramePayload, background_tasks: BackgroundTasks):
@@ -241,10 +327,16 @@ def extract_state_vector(llm_text: str) -> Optional[List[float]]:
         print(f"[-] Regex parameter fallback exception: {e}")
     return None
 
+@functools.lru_cache(maxsize=1)
 def extract_schema_context() -> str:
-    """Introspects live PostgreSQL schema for spatial_scene_store and returns a formatted context string."""
+    """Introspects live PostgreSQL schema for spatial_scene_store and returns a formatted context string.
+
+    The schema is static at runtime, so the result is cached after the first call.
+    This removes a full DB round-trip from the hot path of every /query/sql request.
+    """
+    conn = None
     try:
-        conn = psycopg2.connect(**DB_PARAMS)
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute("""
             SELECT column_name, data_type, udt_name
@@ -254,7 +346,6 @@ def extract_schema_context() -> str:
         """)
         rows = cursor.fetchall()
         cursor.close()
-        conn.close()
 
         annotations = {
             "id":                          "auto-increment primary key — do not filter on this",
@@ -293,7 +384,10 @@ def extract_schema_context() -> str:
         ]
         return "\n".join(lines)
     except Exception as e:
-        return f"Schema introspection failed: {str(e)}"
+        # Do not let lru_cache memoize a failure — raise so the next call retries.
+        raise RuntimeError(f"Schema introspection failed: {str(e)}")
+    finally:
+        put_conn(conn)
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -397,7 +491,6 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
             "- Limit results to 50 rows maximum unless the user asks for aggregates."
         )
 
-        import ollama
         chat_res = ollama.chat(
             model="llama3.2",
             messages=[
@@ -423,11 +516,13 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
             }
 
         # Execute on a read-only connection — PostgreSQL-level safeguard
-        conn = psycopg2.connect(**DB_PARAMS)
+        conn = get_conn(register_vec=True)
         try:
+            # set_session() requires no open transaction; register_vector() may
+            # have opened one, so roll back to a clean state first.
+            conn.rollback()
             conn.set_session(readonly=True)
             cursor = conn.cursor()
-            register_vector(conn)
 
             try:
                 cursor.execute(generated_sql)
@@ -445,7 +540,7 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
 
             cursor.close()
         finally:
-            conn.close()
+            put_conn(conn)
 
         # Embedding column names to suppress (catches aliases via pgvector type check)
         VECTOR_COLS = {"spatial_geometry_embedding"}
@@ -485,24 +580,25 @@ async def query_scenario_pipeline(payload: QueryPayload):
     try:
         query_vector = get_spatial_embedding(payload.prompt)
 
-        conn = psycopg2.connect(**DB_PARAMS)
-        cursor = conn.cursor()
-        register_vector(conn)
+        conn = get_conn(register_vec=True)
+        try:
+            cursor = conn.cursor()
 
-        # Vector similarity search limited to spatial distance tolerances
-        cursor.execute(
-            """
-            SELECT scene_id, frame_timestamp, raw_telemetry_json, (spatial_geometry_embedding <=> %s::vector) as distance
-            FROM spatial_scene_store
-            WHERE (spatial_geometry_embedding <=> %s::vector) < 0.75
-            ORDER BY distance ASC
-            LIMIT 2;
-            """,
-            (query_vector, query_vector)
-        )
-        records = cursor.fetchall()
-        cursor.close()
-        conn.close()
+            # Vector similarity search limited to spatial distance tolerances
+            cursor.execute(
+                """
+                SELECT scene_id, frame_timestamp, raw_telemetry_json, (spatial_geometry_embedding <=> %s::vector) as distance
+                FROM spatial_scene_store
+                WHERE (spatial_geometry_embedding <=> %s::vector) < 0.75
+                ORDER BY distance ASC
+                LIMIT 2;
+                """,
+                (query_vector, query_vector)
+            )
+            records = cursor.fetchall()
+            cursor.close()
+        finally:
+            put_conn(conn)
 
         if not records:
             return {
@@ -553,7 +649,6 @@ async def query_scenario_pipeline(payload: QueryPayload):
             f"=== RETRIEVED TELEMETRY CONTEXT BANDS ===\n{context_payload}\n========================================="
         )
 
-        import ollama
         chat_res = ollama.chat(
             model="llama3.2",
             messages=[
