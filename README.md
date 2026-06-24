@@ -77,7 +77,9 @@ Embedding: sentence-transformers all-MiniLM-L6-v2 (local, no daemon required)
 | FastAPI backend | `main.py` | REST endpoints, ingestion, vector search, NL-to-SQL, DB management |
 | Streamlit UI | `ui.py` | Ingestion workspace, dataset bridge, semantic search, SQL query tab |
 | Dataset bridge library | `dataset_bridge.py` | nuScenes/Waymo coordinate normalization utilities |
-| Benchmark suite | `benchmark_pipeline.py` | Synthetic load generation and latency profiling |
+| Benchmark suite | `benchmark_pipeline.py` | Synthetic load generation and ingestion latency profiling |
+| Pipeline benchmark | `nlp_sql_benchmark.py` | Baseline vs optimized NL-to-SQL data-layer speedup measurement |
+| Edge-case seeder | `seed_test_data.py` | Inserts ~200 edge-case frames across 8 scenarios for query coverage testing |
 | Simulation test | `test_ingest.py` | 10-frame highway simulation ingest test |
 | Waymo unit test | `test_waymo_ingest.py` | Single Waymo frame dispatch and response validation |
 
@@ -97,6 +99,8 @@ The engine stores one row per scene frame in PostgreSQL:
 | `spatial_geometry_embedding` | vector(384) | Dense embedding of the serialized scene description |
 
 Data **persists across server restarts**. Use `DELETE /db/clear` or the UI button to wipe frames manually.
+
+An **HNSW vector index** (`idx_spatial_embedding_hnsw`) is created automatically on startup, replacing full sequential scans with approximate nearest-neighbor lookups for all cosine-distance queries. Falls back to IVFFlat on pgvector < 0.5.0.
 
 ---
 
@@ -320,8 +324,8 @@ Wipes all telemetry frames and resets the identity sequence. Equivalent to `TRUN
 User natural language prompt
           │
           ▼
-extract_schema_context()
-  → queries information_schema.columns
+extract_schema_context()                    ← @lru_cache: DB hit only on first call,
+  → queries information_schema.columns        zero overhead on every subsequent request
   → annotates each column with AV domain meaning
   → documents JSONB structure of raw_telemetry_json
           │
@@ -331,29 +335,50 @@ llama3.2 (via Ollama)
   → user message: natural language prompt
           │
           ▼
+_strip_sql_comments()
+  → removes -- line comments and /* */ block comments before validation
+          │
+          ▼
 extract_sql_block()
   → strips ```sql ... ``` fences from LLM output
           │
           ▼
 validate_generated_sql()
-  → must start with SELECT
-  → blocklist check (DROP, DELETE, INSERT, etc.)
-  → table allowlist (spatial_scene_store only)
+  → must start with SELECT or WITH
+  → word-boundary DML/DDL blocklist (DROP, DELETE, INSERT, UPDATE, etc.)
+  → dangerous function blocklist (pg_read_file, pg_sleep, lo_export, etc.)
+  → multi-statement injection detection
+  → table allowlist (spatial_scene_store only, CTE aliases excluded)
           │
           ├─ VALIDATION_FAILED → return early with rejection reason
           │
           ▼
-psycopg2 (readonly=True connection)
+ThreadedConnectionPool (get_conn)           ← pooled: no TCP handshake per request,
+  → conn.rollback()                           pgvector registered once per connection
+  → conn.set_session(readonly=True)
   → cursor.execute(generated_sql)
           │
           ▼
 Result serialization
-  → embedding column replaced with "[vector omitted]"
+  → embedding column suppressed by name and pgvector type
   → numpy types converted to Python native
+  → datetime/date/time serialized via isoformat()
           │
           ▼
 { generated_sql, rows, row_count, status }
 ```
+
+### Pipeline Performance
+
+The data layer (schema fetch + DB connection overhead) was optimized via connection pooling and schema-context caching. Measured on a local PostgreSQL instance over 50 iterations:
+
+| | Mean latency | P99 latency |
+|---|---|---|
+| Baseline (per-request connect + uncached schema) | 35.1 ms | 41.0 ms |
+| Optimized (pooled + cached) | 0.40 ms | 1.95 ms |
+| **Speedup** | **88x** | **21x** |
+
+LLM inference time is excluded — it is non-deterministic and unchanged by these optimizations. Run `python nlp_sql_benchmark.py` to reproduce on your machine.
 
 ---
 
@@ -396,12 +421,27 @@ python test_ingest.py
 python test_waymo_ingest.py
 ```
 
-**Full stress test (150 frames + query latency profiling):**
+**Full stress test (150 frames + ingestion latency profiling):**
 ```bash
 python benchmark_pipeline.py
 ```
 
 The benchmark generates a synthetic 150-frame Waymo SF Mission sequence at 10 Hz, measures per-frame HTTP ingestion latency (avg, P99, peak), then executes a semantic query and prints the extracted state vector.
+
+**Seed edge-case test data (~200 frames):**
+```bash
+python seed_test_data.py
+```
+
+Inserts frames across 8 edge-case scenarios — zero detected objects, mixed object types (car/pedestrian/cyclist/truck), full occlusion, highway-speed ego, parked ego, extreme object ranges, approaching objects, and a long single-scene sequence. Verifies the final frame count via `/db/stats`. Requires the server to be running.
+
+**Measure NL-to-SQL pipeline speedup:**
+```bash
+python nlp_sql_benchmark.py
+# optional: python nlp_sql_benchmark.py --iterations 100 --warmup 10
+```
+
+Runs 50 timed iterations of the baseline (per-request `psycopg2.connect()` + uncached schema) and the optimized (pooled connections + `lru_cache`d schema) data-layer path against the live PostgreSQL instance, then prints mean/P50/P95/P99 for both and the speedup ratio. Does not require the Uvicorn server — imports `main.py` directly.
 
 ---
 
