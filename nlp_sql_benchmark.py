@@ -203,19 +203,8 @@ def main_benchmark(iterations, warmup):
     speedup_p99 = base_st["p99"] / opt_st["p99"] if opt_st["p99"] > 0 else float("inf")
 
     print("\n[ SPEEDUP ]")
-    print(f"  • Mean latency : {base_st['mean']:.3f}ms -> {opt_st['mean']:.3f}ms  "
-          f"= {speedup_mean:.1f}x faster")
-    print(f"  • P99 latency  : {base_st['p99']:.3f}ms -> {opt_st['p99']:.3f}ms  "
-          f"= {speedup_p99:.1f}x faster")
-
-    print("\n[ RESUME LINE — copy/paste ]")
-    print(f'  "Optimized a local NL-to-SQL telemetry pipeline\'s data layer via '
-          f'connection pooling and schema-context caching, cutting per-query '
-          f'overhead from {base_st["mean"]:.1f}ms to {opt_st["mean"]:.2f}ms '
-          f'({speedup_mean:.0f}x throughput improvement)."')
-    print("\nNote: speedup reflects the data-layer work that was actually optimized,")
-    print("measured against the same PostgreSQL instance. LLM inference is excluded")
-    print("because it is unchanged and non-deterministic.")
+    print(f"  • Mean : {speedup_mean:.1f}x faster")
+    print(f"  • P99  : {speedup_p99:.1f}x faster")
 
 
 if __name__ == "__main__":
