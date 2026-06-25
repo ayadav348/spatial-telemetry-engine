@@ -92,11 +92,19 @@ def init_db():
             CREATE TABLE IF NOT EXISTS spatial_scene_store (
                 id serial PRIMARY KEY,
                 scene_id text NOT NULL,
-                frame_timestamp real NOT NULL,
+                frame_timestamp double precision NOT NULL,
                 ego_velocity_vector real[] NOT NULL,
                 raw_telemetry_json jsonb NOT NULL,
                 spatial_geometry_embedding vector(384)
             );
+        """)
+        conn.commit()
+
+        # Migrate existing deployments: real (32-bit) -> double precision (64-bit).
+        # Safe to run on a fresh DB; no-op if the column is already double precision.
+        cursor.execute("""
+            ALTER TABLE spatial_scene_store
+            ALTER COLUMN frame_timestamp TYPE double precision;
         """)
         conn.commit()
 
@@ -305,8 +313,20 @@ async def ingest_through_dataset_bridge(payload: DatasetBridgePayload, backgroun
         raise HTTPException(status_code=500, detail=f"Dataset Transformation Exception: {str(e)}")
 
 def extract_state_vector(llm_text: str) -> Optional[List[float]]:
-    """Parses strict LaTeX state-space arrays from local LLM context blocks."""
-    math_pattern = r"x\s*=\s*\[\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\s*\]\^T"
+    """Parses LaTeX state-space arrays from local LLM context blocks.
+
+    Tolerates common Llama formatting variations on the transpose suffix:
+      ]^T  ]^{T}  ] ^ T  ] ^{T}  or no transpose at all.
+    """
+    # Optional transpose: \s*\^?\s*\{?T\}? covers ^T, ^{T}, ^ T, ^{T}, and absent.
+    math_pattern = (
+        r"x\s*=\s*\[\s*"
+        r"(-?\d+(?:\.\d+)?),\s*"
+        r"(-?\d+(?:\.\d+)?),\s*"
+        r"(-?\d+(?:\.\d+)?),\s*"
+        r"(-?\d+(?:\.\d+)?)\s*"
+        r"\](?:\s*\^?\s*\{?T\}?)?"
+    )
     match = re.search(math_pattern, llm_text)
     if match:
         return [float(c) for c in match.groups()]
