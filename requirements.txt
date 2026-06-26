@@ -9,6 +9,7 @@ sentence-transformers>=3.0.0
 # --- Streamlit UI (ui.py) ---
 streamlit>=1.40.0
 requests>=2.32.0
+matplotlib>=3.8.0  # Scene Viewer top-down BEV rendering
 
 # --- Dataset Bridge & Benchmarking (dataset_bridge.py, benchmark_pipeline.py) ---
 numpy>=1.26.0

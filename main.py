@@ -163,6 +163,72 @@ def get_db_stats():
     finally:
         put_conn(conn)
 
+# --- Scene Discovery Endpoints (Scene Viewer / BEV visualizer) ---
+@app.get("/scenes")
+def list_scenes():
+    """Returns every distinct scene_id in the store with its frame count.
+
+    Powers the Scene Viewer dropdown so the UI never has to ask the LLM to
+    generate SQL just to enumerate what is in the database.
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT scene_id, COUNT(*) AS frame_count
+            FROM spatial_scene_store
+            GROUP BY scene_id
+            ORDER BY scene_id ASC;
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        return {"scenes": [{"scene_id": r[0], "frame_count": r[1]} for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scene enumeration failed: {str(e)}")
+    finally:
+        put_conn(conn)
+
+
+@app.get("/frames/{scene_id}")
+def get_scene_frames(scene_id: str):
+    """Returns all frames for a single scene, ordered by timestamp.
+
+    Each frame includes its ego velocity and the full detected_objects list so
+    the Scene Viewer can render a top-down BEV diagram without any LLM round-trip.
+    The 384-dim embedding is never selected.
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT frame_timestamp, ego_velocity_vector, raw_telemetry_json
+            FROM spatial_scene_store
+            WHERE scene_id = %s
+            ORDER BY frame_timestamp ASC, id ASC;
+            """,
+            (scene_id,)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+
+        frames = []
+        for ts, ego_vel, raw_json in rows:
+            frames.append({
+                "frame_timestamp": ts,
+                "ego_velocity_vector": list(ego_vel) if ego_vel is not None else [0.0, 0.0, 0.0],
+                "detected_objects": raw_json.get("detected_objects", []),
+            })
+
+        return {"scene_id": scene_id, "frame_count": len(frames), "frames": frames}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Frame retrieval failed: {str(e)}")
+    finally:
+        put_conn(conn)
+
+
 # --- Manual Database Clear Endpoint ---
 @app.delete("/db/clear")
 def clear_database():
@@ -419,10 +485,27 @@ def _strip_sql_comments(sql: str) -> str:
     return sql.strip()
 
 
+def _normalize_sql(sql: str) -> str:
+    """Strip comments then collapse all trailing semicolons.
+
+    The LLM sometimes emits 'ORDER BY x DESC;\nLIMIT 50;' — the mid-query
+    semicolon is a formatting artifact, not a second statement. Removing all
+    trailing semicolons before validation lets the multi-statement check focus
+    on genuine injection attempts (a semicolon followed by a real SQL keyword).
+    """
+    sql = _strip_sql_comments(sql)
+    # Remove every semicolon that is only followed by whitespace or end-of-string
+    sql = re.sub(r';\s*$', '', sql.strip())
+    # Collapse any remaining internal sequences of whitespace around lone semicolons
+    # that are immediately followed by SQL clause keywords the LLM split onto new lines.
+    # e.g. "DESC;\nLIMIT" -> "DESC\nLIMIT"
+    sql = re.sub(r';\s*(LIMIT|OFFSET|UNION|EXCEPT|INTERSECT)\b', r' \1', sql, flags=re.IGNORECASE)
+    return sql.strip()
+
+
 def validate_generated_sql(sql: str) -> tuple:
     """Validates LLM-generated SQL. Returns (is_valid: bool, reason: str)."""
-    # Strip comments before any analysis so they don't trigger false positives
-    clean_sql = _strip_sql_comments(sql)
+    clean_sql = _normalize_sql(sql)
     stripped = clean_sql.strip().upper()
 
     if not stripped.startswith("SELECT") and not re.match(r'^\s*WITH\b', stripped):
@@ -444,8 +527,10 @@ def validate_generated_sql(sql: str) -> tuple:
         if term in stripped:
             return False, f"Forbidden function/keyword detected: '{term}'"
 
-    # Block multi-statement injection (bare semicolon followed by another statement)
-    if re.search(r';\s*\S', stripped):
+    # Block genuine multi-statement injection: a semicolon followed by a real
+    # SQL keyword. Trailing semicolons are already stripped by _normalize_sql
+    # so this only fires on things like "SELECT 1; DROP TABLE ..." .
+    if re.search(r';\s*\w', stripped):
         return False, "Multi-statement queries are not permitted."
 
     allowed_tables = {"SPATIAL_SCENE_STORE"}
@@ -524,6 +609,9 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
             raise HTTPException(status_code=502, detail="LLM returned an empty response. Try rephrasing the query.")
 
         generated_sql = extract_sql_block(raw_llm_output)
+        # Normalize before validation: strip comments and collapse the
+        # mid-query semicolons the LLM emits before LIMIT/OFFSET clauses.
+        clean_sql = _normalize_sql(generated_sql)
 
         is_valid, rejection_reason = validate_generated_sql(generated_sql)
         if not is_valid:
@@ -545,7 +633,7 @@ async def natural_language_sql_query(payload: SQLQueryPayload):
             cursor = conn.cursor()
 
             try:
-                cursor.execute(generated_sql)
+                cursor.execute(clean_sql)
                 raw_rows = cursor.fetchall()
                 col_names = [desc[0] for desc in cursor.description]
             except Exception as exec_err:
@@ -680,10 +768,18 @@ async def query_scenario_pipeline(payload: QueryPayload):
         raw_llm_output = chat_res['message']['content']
         extracted_seed = extract_state_vector(raw_llm_output)
 
+        # Return the raw DB records the LLM was given so the UI can show
+        # exactly which scene/frame was retrieved and let the user verify.
+        source_frames = [
+            {"scene_id": row[0], "frame_timestamp": row[1], "similarity_distance": row[3]}
+            for row in records
+        ]
+
         return {
             "answer": raw_llm_output,
             "state_vector_seed": extracted_seed,
-            "status": "SUCCESS" if extracted_seed else "METRIC_EXTRACTION_FAILED"
+            "status": "SUCCESS" if extracted_seed else "METRIC_EXTRACTION_FAILED",
+            "source_frames": source_frames,
         }
 
     except Exception as e:
