@@ -22,9 +22,11 @@ The Spatial Telemetry Engine solves two distinct problems over 3D AV scene logs:
 
 4. **NL-to-SQL Query Engine** — Introspects the live PostgreSQL schema at query time, injects it as structured context into a `llama3.2` prompt with AV-domain annotations, extracts and validates the generated SQL (SELECT-only, injection-safe), executes it on a read-only connection, and returns raw results as a structured JSON response.
 
-5. **Streamlit Dashboard** — A browser-based UI with an ingestion workspace (native JSON and dataset bridge tabs) and a query workspace (semantic search tab and NL-to-SQL tab with preset queries and live results table).
+5. **Streamlit Dashboard** — A browser-based UI with an ingestion workspace (native JSON and dataset bridge tabs), a query workspace (semantic search tab and NL-to-SQL tab with preset queries and live results table), and a **Scene Viewer** for visualizing indexed scenes directly in the browser.
 
-6. **Manual Database Control** — Data persists across server restarts. A dedicated `DELETE /db/clear` endpoint (with a UI button) allows on-demand wipe of all frames for re-ingestion demos.
+6. **Scene Viewer (BEV)** — A top-down bird's-eye-view (BEV) visualizer that renders any indexed scene without requiring camera hardware, video files, or the Waymo SDK. Objects are color-coded by class, velocity arrows are drawn on every moving agent, occlusion is encoded visually, and range rings provide spatial reference. Frames are navigable via a slider, Prev/Next buttons, or auto-play.
+
+7. **Manual Database Control** — Data persists across server restarts. A dedicated `DELETE /db/clear` endpoint (with a UI button) allows on-demand wipe of all frames for re-ingestion demos.
 
 ---
 
@@ -45,9 +47,9 @@ The Spatial Telemetry Engine solves two distinct problems over 3D AV scene logs:
 │                    User Interface Layer                     │
 │                Streamlit  (ui.py :8501)                     │
 │                                                             │
-│  Ingestion Workspace        Query Workspace                 │
-│  ├─ Native Stream Payload   ├─ NL → SQL Query (new)        │
-│  └─ Dataset Bridge          └─ Scenario Vector Search       │
+│  Ingestion Workspace        Query Workspace    Scene Viewer │
+│  ├─ Native Stream Payload   ├─ NL → SQL Query  ├─ BEV plot │
+│  └─ Dataset Bridge          └─ Scenario Search └─ Frame nav│
 └────────────────────────┬────────────────────────────────────┘
                          │  HTTP
 ┌────────────────────────▼────────────────────────────────────┐
@@ -58,6 +60,8 @@ The Spatial Telemetry Engine solves two distinct problems over 3D AV scene logs:
 │  POST   /ingest/dataset-bridge → dataset normalization      │
 │  POST   /query/scenario        → semantic search + LLM      │
 │  POST   /query/sql             → NL-to-SQL generation       │
+│  GET    /scenes                → list all scene IDs         │
+│  GET    /frames/{scene_id}     → all frames for BEV render  │
 │  GET    /db/stats              → frame count                │
 │  DELETE /db/clear              → manual database wipe       │
 └──────────┬──────────────────────────────┬───────────────────┘
@@ -74,8 +78,8 @@ Embedding: sentence-transformers all-MiniLM-L6-v2 (local, no daemon required)
 
 | Component | File | Role |
 |-----------|------|------|
-| FastAPI backend | `main.py` | REST endpoints, ingestion, vector search, NL-to-SQL, DB management |
-| Streamlit UI | `ui.py` | Ingestion workspace, dataset bridge, semantic search, SQL query tab |
+| FastAPI backend | `main.py` | REST endpoints, ingestion, vector search, NL-to-SQL, scene listing, DB management |
+| Streamlit UI | `ui.py` | Ingestion workspace, dataset bridge, semantic search, SQL query tab, Scene Viewer (BEV) |
 | Dataset bridge library | `dataset_bridge.py` | nuScenes/Waymo coordinate normalization utilities |
 | Benchmark suite | `benchmark_pipeline.py` | Synthetic load generation and ingestion latency profiling |
 | Pipeline benchmark | `nlp_sql_benchmark.py` | Baseline vs optimized NL-to-SQL data-layer speedup measurement |
@@ -109,6 +113,7 @@ An **HNSW vector index** (`idx_spatial_embedding_hnsw`) is created automatically
 - Python 3.10+
 - PostgreSQL running locally on port `5432` with the `pgvector` extension
 - Ollama with `llama3.2` pulled (required for `/query/scenario` LLM synthesis and `/query/sql` generation — ingestion works without it)
+- `matplotlib >= 3.8.0` (required for BEV rendering in the Scene Viewer — included in `requirements.txt`)
 
 ---
 
@@ -257,11 +262,16 @@ Semantic search over indexed frames. Embeds the prompt, finds nearest frames by 
 {
   "answer": "$$x = [2.5, 14.2, -8.5, 0.2]^T$$\n- Target ID: 105\n...",
   "state_vector_seed": [2.5, 14.2, -8.5, 0.2],
+  "source_frames": [
+    { "scene_id": "waymo-sf-mission-seq-1092", "frame_timestamp": 182.904, "similarity_distance": 0.142 }
+  ],
   "status": "SUCCESS"
 }
 ```
 
 `state_vector_seed` is `[X, Y, Vx, Vy]` extracted from the LLM output, ready to initialize a tracking filter. Returns `null` if extraction fails or Ollama is not available.
+
+`source_frames` lists the database frames that were retrieved and fed to the LLM as context, including the scene ID, timestamp, and cosine similarity distance for each. The UI displays these as an attribution box with a **"View in BEV"** button that jumps the Scene Viewer directly to the referenced scene.
 
 ---
 
@@ -302,6 +312,50 @@ Security model:
 
 ---
 
+### `GET /scenes`
+
+Returns all distinct scene IDs stored in the database with their frame counts. Used by the Scene Viewer dropdown — no LLM round-trip required.
+
+**Response:**
+```json
+{
+  "scenes": [
+    { "scene_id": "waymo-sf-mission-seq-1092", "frame_count": 150 },
+    { "scene_id": "nuscenes-log-segment-081", "frame_count": 40 }
+  ]
+}
+```
+
+---
+
+### `GET /frames/{scene_id}`
+
+Returns all frames for the given scene ordered by timestamp. Each frame includes ego velocity and the full detected objects list for BEV rendering.
+
+**Response:**
+```json
+{
+  "scene_id": "waymo-sf-mission-seq-1092",
+  "frames": [
+    {
+      "frame_timestamp": 182.904,
+      "ego_velocity_vector": [14.15, 0.22, -0.02],
+      "detected_objects": [
+        {
+          "target_id": 105,
+          "classification": "car",
+          "center_xyz": [2.5, 14.2, -0.1],
+          "velocity_vector": [-8.5, 0.2, 0.0],
+          "occlusion_state": "partial_500ms"
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
 ### `GET /db/stats`
 
 Returns the current frame count.
@@ -339,11 +393,17 @@ _strip_sql_comments()
   → removes -- line comments and /* */ block comments before validation
           │
           ▼
+_normalize_sql()
+  → strips trailing semicolons
+  → collapses mid-query semicolons before LIMIT/OFFSET that the LLM emits
+    (prevents valid queries from failing the multi-statement injection check)
+          │
+          ▼
 extract_sql_block()
   → strips ```sql ... ``` fences from LLM output
           │
           ▼
-validate_generated_sql()
+validate_generated_sql()   ← validates clean_sql, not raw LLM output
   → must start with SELECT or WITH
   → word-boundary DML/DDL blocklist (DROP, DELETE, INSERT, UPDATE, etc.)
   → dangerous function blocklist (pg_read_file, pg_sleep, lo_export, etc.)
@@ -379,6 +439,43 @@ The data layer (schema fetch + DB connection overhead) was optimized via connect
 | **Speedup** | **88x** | **21x** |
 
 LLM inference time is excluded — it is non-deterministic and unchanged by these optimizations. Run `python nlp_sql_benchmark.py` to reproduce on your machine.
+
+### NL-to-SQL Aggregation Rules
+
+The system prompt enforces AV-domain SQL patterns to prevent invalid queries:
+
+- **Window functions must not be nested inside aggregates.** PostgreSQL rejects constructs like `SUM(frame_timestamp - LAG(frame_timestamp) OVER (...))`. The engine's prompt explicitly forbids this and provides the correct alternatives:
+  - Scene duration: `MAX(frame_timestamp) - MIN(frame_timestamp)` inside a `GROUP BY`
+  - Ego speed aggregation: `AVG(sqrt(ego_velocity_vector[1]^2 + ego_velocity_vector[2]^2))`
+- The `spatial_geometry_embedding` pgvector column must never appear in `SELECT` or `WHERE`.
+- `classification` is nested inside `detected_objects` — `raw_telemetry_json ->> 'classification'` is invalid; use `jsonb_array_length` or array indexing into `detected_objects`.
+
+---
+
+## Scene Viewer
+
+The Scene Viewer renders any indexed scene as a top-down bird's-eye-view (BEV) diagram directly in the Streamlit dashboard — no camera feed, video files, or Waymo SDK needed.
+
+```
+/scenes  →  scene dropdown          /frames/{scene_id}  →  frame data
+     │                                        │
+     ▼                                        ▼
+Scene selector UI             render_bev_frame() (matplotlib)
+                                ├─ ego vehicle fixed at origin, facing +X
+                                ├─ objects at ego-relative (X, Y) coordinates
+                                ├─ color by class: red=car, dark red=truck,
+                                │                  teal=pedestrian, orange=cyclist
+                                ├─ velocity arrows on all moving objects
+                                ├─ occlusion: faded+dashed=total, semi-transparent=partial
+                                └─ range rings every 10 m with distance labels
+```
+
+**UI controls:**
+- Scene dropdown populated from `/scenes` (all DB content, not hardcoded)
+- Frame slider + Prev/Next buttons + auto-play checkbox with adjustable speed
+- BEV plot (left column) + object data table (right column)
+- Frames cached in session state per scene — no re-fetch on slider moves; cache cleared on scene switch
+- **"View in BEV"** button in scenario query results jumps the viewer to the referenced scene
 
 ---
 
